@@ -1027,4 +1027,9 @@ mod tests {
             assert_eq!(transform_to_value[0].value, F::from(expected));
         }
     }
+
+    #[test]
+    fn num_rows_per_round(){
+        assert_eq!(get_num_rows_per_round(), 12);
+    }
 }
