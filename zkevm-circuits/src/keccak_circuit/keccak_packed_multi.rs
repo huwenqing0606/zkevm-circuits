@@ -773,6 +773,7 @@ pub(crate) fn keccak<F: Field>(
             };
 
             // The words to squeeze out
+            // Hu: hash_words becomes s[0][0], s[1][0], s[2][0], s[3][0]
             hash_words = s.into_iter().take(4).map(|a| a[0]).take(4).collect();
             round_lengths.push(length);
             round_data_rlcs.push(data_rlcs);
@@ -783,7 +784,9 @@ pub(crate) fn keccak<F: Field>(
 
         // Now that we know the state at the end of the rounds, set the squeeze data
         let num_rounds = cell_managers.len();
+        // Hu: num_rounds becomes 25 now
         for (idx, word) in hash_words.iter().enumerate() {
+            // Hu: start from cell_managers[23], which is last round
             let cell_manager = &mut cell_managers[num_rounds - 2 - idx];
             let region = &mut regions[num_rounds - 2 - idx];
 
