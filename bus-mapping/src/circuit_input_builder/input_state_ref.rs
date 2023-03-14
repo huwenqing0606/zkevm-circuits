@@ -278,9 +278,10 @@ impl<'a> CircuitInputStateRef<'a> {
         // -- sanity check begin --
         // Verify that a READ doesn't change the field value
         if matches!(rw, RW::READ) && op.value_prev != op.value {
-            panic!(
+            log::error!(
                 "RWTable Account field read where value_prev != value rwc: {}, op: {:?}",
-                self.block_ctx.rwc.0, op
+                self.block_ctx.rwc.0,
+                op
             )
         }
         // NOTE: In the State Circuit we use code_hash=0 to encode non-existing
@@ -306,10 +307,13 @@ impl<'a> CircuitInputStateRef<'a> {
 
         // Verify that the previous value matches the account field value in the StateDB
         if op.value_prev != account_value_prev {
-            panic!(
+            log::error!(
                 "RWTable Account field {:?} lookup doesn't match account value
         account: {:?}, rwc: {}, op: {:?}",
-                rw, account, self.block_ctx.rwc.0, op
+                rw,
+                account,
+                self.block_ctx.rwc.0,
+                op
             );
         }
         // Verify that no read is done to a field other than CodeHash to a non-existing
@@ -709,7 +713,14 @@ impl<'a> CircuitInputStateRef<'a> {
         if !found {
             return Err(Error::AccountNotFound(sender));
         }
-        Ok(get_contract_address(sender, account.nonce))
+        let address = get_contract_address(sender, account.nonce);
+        log::trace!(
+            "create_address {:?}, from {:?}, nonce {:?}",
+            address,
+            self.call()?.address,
+            account.nonce
+        );
+        Ok(address)
     }
 
     /// Return the contract address of a CREATE2 step.  This is calculated
@@ -718,11 +729,15 @@ impl<'a> CircuitInputStateRef<'a> {
         let salt = step.stack.nth_last(3)?;
         let call_ctx = self.call_ctx()?;
         let init_code = get_create_init_code(call_ctx, step)?.to_vec();
-        Ok(get_create2_address(
+        let address =
+            get_create2_address(self.call()?.address, salt.to_be_bytes().to_vec(), init_code);
+        log::trace!(
+            "create2_address {:?}, from {:?}, salt {:?}",
+            address,
             self.call()?.address,
-            salt.to_be_bytes().to_vec(),
-            init_code,
-        ))
+            salt
+        );
+        Ok(address)
     }
 
     pub(crate) fn reversion_info_read(&mut self, step: &mut ExecStep, call: &Call) {
@@ -969,7 +984,7 @@ impl<'a> CircuitInputStateRef<'a> {
                             (0, 0)
                         } else {
                             (
-                                step.stack.nth_last(0)?.as_usize(),
+                                step.stack.nth_last(0)?.low_u64() as usize,
                                 step.stack.nth_last(1)?.as_usize(),
                             )
                         };
@@ -1385,6 +1400,15 @@ impl<'a> CircuitInputStateRef<'a> {
                 }
             }
 
+            if matches!(step.op, OpcodeId::CREATE | OpcodeId::CREATE2) {
+                let addr = call.address;
+                let acc = self.sdb.get_account(&addr).1;
+                let max_nonce = (-1i64 as u64).into();
+                if acc.nonce == max_nonce {
+                    return Ok(Some(ExecError::NonceUintOverflow));
+                }
+            }
+
             return Err(Error::UnexpectedExecStepError(
                 "*CALL*/CREATE* code not executed",
                 step.clone(),
@@ -1561,6 +1585,41 @@ impl<'a> CircuitInputStateRef<'a> {
             };
             copy_steps.push((value, false));
             self.memory_write(exec_step, (dst_addr + idx).into(), value)?;
+        }
+
+        Ok(copy_steps)
+    }
+
+    pub(crate) fn gen_copy_steps_for_log(
+        &mut self,
+        exec_step: &mut ExecStep,
+        src_addr: u64,
+        bytes_left: u64,
+    ) -> Result<Vec<(u8, bool)>, Error> {
+        // Get memory data
+        let mem = self
+            .call_ctx()?
+            .memory
+            .read_chunk(src_addr.into(), bytes_left.into());
+
+        let mut copy_steps = Vec::with_capacity(bytes_left as usize);
+        for (idx, byte) in mem.iter().enumerate() {
+            let addr = src_addr + idx as u64;
+
+            // Read memory
+            self.memory_read(exec_step, (addr as usize).into(), *byte)?;
+
+            copy_steps.push((*byte, false));
+
+            // Write log
+            self.tx_log_write(
+                exec_step,
+                self.tx_ctx.id(),
+                self.tx_ctx.log_id + 1,
+                TxLogField::Data,
+                idx,
+                Word::from(*byte),
+            )?;
         }
 
         Ok(copy_steps)
