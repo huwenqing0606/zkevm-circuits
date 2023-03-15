@@ -107,7 +107,7 @@ pub(crate) struct CellColumn<F> {
 pub(crate) struct CellManager<F> {
     height: usize,
     columns: Vec<CellColumn<F>>,
-    rows: Vec<usize>,
+    row_widths: Vec<usize>,
     num_unused_cells: usize,
 }
 
@@ -116,7 +116,7 @@ impl<F: FieldExt> CellManager<F> {
         Self {
             height,
             columns: Vec::new(),
-            rows: vec![0; height],
+            row_widths: vec![0; height],
             num_unused_cells: 0,
         }
     }
@@ -131,8 +131,8 @@ impl<F: FieldExt> CellManager<F> {
         meta: &mut ConstraintSystem<F>,
         row_idx: i32,
     ) -> Cell<F> {
-        let column_idx = self.rows[row_idx as usize];
-        self.rows[row_idx as usize] += 1;
+        let column_idx = self.row_widths[row_idx as usize];
+        self.row_widths[row_idx as usize] += 1;
         self.query_cell_at_pos(meta, row_idx, column_idx)
     }
 
@@ -142,23 +142,23 @@ impl<F: FieldExt> CellManager<F> {
     }
 
     pub(crate) fn query_cell_value_at_row(&mut self, row_idx: i32) -> Cell<F> {
-        let column_idx = self.rows[row_idx as usize];
-        self.rows[row_idx as usize] += 1;
+        let column_idx = self.row_widths[row_idx as usize];
+        self.row_widths[row_idx as usize] += 1;
         self.query_cell_value_at_pos(row_idx, column_idx)
     }
 
     pub(crate) fn start_region(&mut self) -> usize {
         // Make sure all rows start at the same column
         let width = self.get_width();
-        for row in self.rows.iter_mut() {
-            self.num_unused_cells += width - *row;
-            *row = width;
+        for row_width in self.row_widths.iter_mut() {
+            self.num_unused_cells += width - *row_width;
+            *row_width = width;
         }
         width
     }
 
     pub(crate) fn get_width(&self) -> usize {
-        self.rows.iter().cloned().max().unwrap()
+        self.row_widths.iter().cloned().max().unwrap()
     }
 
     pub(crate) fn columns(&self) -> &[CellColumn<F>] {
@@ -203,13 +203,13 @@ impl<F: FieldExt> CellManager<F> {
     fn get_position(&mut self) -> (usize, usize) {
         let mut best_row_idx = 0usize;
         let mut best_row_pos = 100000usize;
-        for (row_idx, row) in self.rows.iter().enumerate() {
-            if *row < best_row_pos {
-                best_row_pos = *row;
+        for (row_idx, row_width) in self.row_widths.iter().enumerate() {
+            if *row_width < best_row_pos {
+                best_row_pos = *row_width;
                 best_row_idx = row_idx;
             }
         }
-        self.rows[best_row_idx] += 1;
+        self.row_widths[best_row_idx] += 1;
         (best_row_idx, best_row_pos)
     }
 }
