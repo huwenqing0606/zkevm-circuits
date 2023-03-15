@@ -141,12 +141,12 @@ pub(crate) mod split {
         cell_manager: &mut CellManager<F>,
         cb: &mut BaseConstraintBuilder<F>,
         input: Expression<F>,
-        rot: usize,
+        bit_rot: usize,
         target_part_size: usize,
         normalize: bool,
     ) -> Vec<Part<F>> {
         let mut parts = Vec::new();
-        let word = WordParts::new(target_part_size, rot, normalize);
+        let word = WordParts::new(target_part_size, bit_rot, normalize);
         for word_part in word.parts {
             let cell = cell_manager.query_cell(meta);
             parts.push(Part {
@@ -164,14 +164,14 @@ pub(crate) mod split {
         cell_manager: &mut CellManager<F>,
         region: &mut KeccakRegion<F>,
         input: F,
-        rot: usize,
+        bit_rot: usize,
         target_part_size: usize,
         normalize: bool,
     ) -> Vec<PartValue<F>> {
         let input_bits = unpack(input);
         debug_assert_eq!(pack::<F>(&input_bits), input);
         let mut parts = Vec::new();
-        let word = WordParts::new(target_part_size, rot, normalize);
+        let word = WordParts::new(target_part_size, bit_rot, normalize);
         for word_part in word.parts {
             let value = pack_part(&input_bits, &word_part);
             let cell = cell_manager.query_cell_value();
@@ -205,15 +205,15 @@ pub(crate) mod split_uniform {
         cell_manager: &mut CellManager<F>,
         cb: &mut BaseConstraintBuilder<F>,
         input: Expression<F>,
-        rot: usize,
+        bit_rot: usize,
         target_part_size: usize,
         normalize: bool,
     ) -> Vec<Part<F>> {
         let mut input_parts = Vec::new();
         let mut output_parts = Vec::new();
-        let word = WordParts::new(target_part_size, rot, normalize);
+        let word = WordParts::new(target_part_size, bit_rot, normalize);
 
-        let word = rotate(word.parts, rot, target_part_size);
+        let word = rotate(word.parts, bit_rot, target_part_size);
 
         let target_sizes = target_part_sizes(target_part_size);
         let mut word_iter = word.iter();
@@ -268,7 +268,7 @@ pub(crate) mod split_uniform {
                 unreachable!();
             }
         }
-        let input_parts = rotate_rev(input_parts, rot, target_part_size);
+        let input_parts = rotate_rev(input_parts, bit_rot, target_part_size);
         // Input parts need to equal original input expression
         cb.require_equal("split", decode::expr(input_parts), input);
         // Uniform output
@@ -280,7 +280,7 @@ pub(crate) mod split_uniform {
         cell_manager: &mut CellManager<F>,
         region: &mut KeccakRegion<F>,
         input: F,
-        rot: usize,
+        bit_rot: usize,
         target_part_size: usize,
         normalize: bool,
     ) -> Vec<PartValue<F>> {
@@ -289,9 +289,9 @@ pub(crate) mod split_uniform {
 
         let mut input_parts = Vec::new();
         let mut output_parts = Vec::new();
-        let word = WordParts::new(target_part_size, rot, normalize);
+        let word = WordParts::new(target_part_size, bit_rot, normalize);
 
-        let word = rotate(word.parts, rot, target_part_size);
+        let word = rotate(word.parts, bit_rot, target_part_size);
 
         let target_sizes = target_part_sizes(target_part_size);
         let mut word_iter = word.iter();
@@ -350,7 +350,7 @@ pub(crate) mod split_uniform {
                 unreachable!();
             }
         }
-        let input_parts = rotate_rev(input_parts, rot, target_part_size);
+        let input_parts = rotate_rev(input_parts, bit_rot, target_part_size);
         debug_assert_eq!(decode::value(input_parts), input);
         output_parts
     }
