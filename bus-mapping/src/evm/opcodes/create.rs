@@ -20,7 +20,8 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
         let geth_step = &geth_steps[0];
         let mut exec_step = state.new_step(geth_step)?;
 
-        let offset = geth_step.stack.nth_last(1)?.as_usize();
+        // Get low Uint64 of offset.
+        let offset = geth_step.stack.nth_last(1)?.low_u64() as usize;
         let length = geth_step.stack.nth_last(2)?.as_usize();
 
         if length != 0 {
@@ -47,6 +48,13 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
         } else {
             state.create_address()?
         };
+
+        let callee_account = &state.sdb.get_account(&address).1.clone();
+        let callee_exists = !callee_account.is_empty();
+        if !callee_exists && callee.value.is_zero() {
+            state.sdb.get_account_mut(&address).1.storage.clear();
+        }
+
         state.stack_write(
             &mut exec_step,
             geth_step.stack.nth_last_filled(n_pop - 1),
@@ -183,6 +191,7 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
             (CallContextField::IsStatic, false.to_word()),
             (CallContextField::IsCreate, true.to_word()),
             (CallContextField::CodeHash, Word::from(code_hash)),
+            (CallContextField::Value, callee.value),
         ] {
             state.call_context_write(&mut exec_step, callee.call_id, field, value);
         }
