@@ -977,6 +977,7 @@ impl<F: Field> SubCircuit<F> for KeccakCircuit<F> {
                 .iter()
                 .map(|bytes| (bytes.len() as f64 / 136.0).ceil() as usize * rows_per_chunk)
                 .sum(),
+            // Hu: 136 = 17 (absorb size) * 8 (bits in bytes)
             block.circuits_params.max_keccak_rows,
         )
     }
