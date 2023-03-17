@@ -160,6 +160,7 @@ impl Sponge {
             let mut x = 0;
             let mut y = 0;
             for i in 0..(self.rate / 8) {
+                // Hu: self.rate / 8 = 17, so absorb happens for the first 17 lanes
                 let word = words[chunk_offset + i];
                 state[x][y] ^= word;
                 if x < 5 - 1 {
@@ -176,12 +177,15 @@ impl Sponge {
     pub fn squeeze(&self, state: &mut State) -> Vec<u8> {
         let mut output: Vec<u8> = vec![];
 
+        // Hu:  in this case output_len = 32
+        //      so elems_total = 4
         let output_len: usize = self.capacity / 2;
         let elems_total: usize = output_len / 8;
         let mut counter: usize = 0;
 
         'outer: for y in 0..5 {
             for sheet in state.iter().take(5) {
+                // Hu: takes state[0][0], [1][0], [2][0], [3][0] as squeeze
                 output.append(&mut sheet[y].to_le_bytes().to_vec());
                 if counter == elems_total {
                     break 'outer;
