@@ -456,7 +456,11 @@ impl<F: Field> SubCircuitConfig<F> for KeccakCircuitConfig<F> {
         // over those 24 rounds. In a single round (in 4 of the 24 rounds) a
         // single word is converted to bytes.
         // Potential optimization: could do multiple bytes per lookup
-        cell_manager.start_region();
+        
+        // Hu: squeeze_from is a very sparse column
+        // can save one column by merging it with squeeze_from_parts
+        //cell_manager.start_region();
+        
         // Unpack a single word into bytes (for the squeeze)
         // Potential optimization: could do multiple bytes per lookup
         let squeeze_from_parts = split::expr(

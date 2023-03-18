@@ -791,7 +791,9 @@ pub(crate) fn keccak<F: Field>(
             let squeeze_packed = cell_manager.query_cell_value();
             squeeze_packed.assign(region, 0, *word);
 
-            cell_manager.start_region();
+            // Hu: squeeze_from = squeeze_packed is a very sparse column
+            // can save one column by merging it with squeeze_from_parts = packed
+            //cell_manager.start_region();
             let packed = split::value(cell_manager, region, *word, 0, 8, false);
             cell_manager.start_region();
             transform::value(cell_manager, region, packed, false, |v| *v, true);
