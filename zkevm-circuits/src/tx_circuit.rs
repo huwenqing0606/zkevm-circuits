@@ -1277,10 +1277,14 @@ impl<F: Field> TxCircuit<F> {
         let mut inputs = Vec::new();
 
         let padding_tx = {
+            // wenqing: padding_tx given by dummy tx
             let mut tx = Transaction::dummy(self.chain_id);
             tx.id = self.txs.len() + 1;
             tx
         };
+        // wenqing: The resulting hash_datas variable 
+        // is a vector of RLP-encoded and signed transactions, 
+        // including the padding transaction.
         let hash_datas = self
             .txs
             .iter()
@@ -1289,6 +1293,10 @@ impl<F: Field> TxCircuit<F> {
             .collect::<Vec<Vec<u8>>>();
         inputs.extend_from_slice(&hash_datas);
 
+        // wenqing: creates a vector of SignData from the 
+        // signed transactions by filtering out the unsigned 
+        // transactions and then mapping the remaining 
+        // transactions to their sign data.
         let sign_datas: Vec<SignData> = self
             .txs
             .iter()
@@ -1315,7 +1323,8 @@ impl<F: Field> TxCircuit<F> {
         // Keccak inputs from SignVerify Chip
         let sign_verify_inputs = keccak_inputs_sign_verify(&sign_datas);
         inputs.extend_from_slice(&sign_verify_inputs);
-
+        
+        // wenqing: inputs = [hash_datas, sign_verify_inputs]
         Ok(inputs)
     }
 
