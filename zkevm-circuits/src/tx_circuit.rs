@@ -1341,6 +1341,7 @@ impl<F: Field> TxCircuit<F> {
             .map(|tx| tx.block_number)
             .collect::<BTreeSet<u64>>();
         let mut num_txs_in_blocks = BTreeMap::new();
+        // wenqing: find the number of txs in each block listed by block_number
         for tx in self.txs.iter() {
             if let Some(num_txs) = num_txs_in_blocks.get_mut(&tx.block_number) {
                 *num_txs += 1;
@@ -1349,6 +1350,19 @@ impl<F: Field> TxCircuit<F> {
             }
         }
 
+        // wenqing: 
+        // development block table assignment
+        // block table:
+        // | block_table tag | block_num | cum_num txs | 
+        // +-----+-------+-------+
+        // | Tag | Index | Value |
+        // +-----+-------+-------+
+        // |  t1 |  b1   |  v1   |
+        // |  t2 |  b2   |  v2   |
+        // |  t3 |  b3   |  v3   |
+        // | ... | ...   | ...   |
+        // |  tn |  bn   |  vn   |
+        // +-----+-------+-------+
         layouter.assign_region(
             || "dev block table",
             |mut region| {
