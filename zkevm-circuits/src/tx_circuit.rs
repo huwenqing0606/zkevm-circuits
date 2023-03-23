@@ -277,7 +277,12 @@ impl<F: Field> SubCircuitConfig<F> for TxCircuitConfig<F> {
         let calldata_length = meta.advice_column();
         let calldata_gas_cost_acc = meta.advice_column();
         let chain_id = meta.advice_column();
-
+        
+        // wenqing: determine when calldata lookup into tx table
+        // when
+        // (1) tag is calldata_length
+        // and 
+        // (2) any of CallerAddress, CalleeAddress, CallDataLength, CallData is not 0
         meta.create_gate("calldata lookup into tx table condition", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
@@ -285,6 +290,8 @@ impl<F: Field> SubCircuitConfig<F> for TxCircuitConfig<F> {
                 "condition",
                 and::expr([
                     is_data_length(meta),
+                    // wenqing: value_is_zero is a IsZeroChip
+                    // its .is_zero_expression is the expr returned by this chip
                     not::expr(value_is_zero.is_zero_expression.expr()),
                 ]),
                 meta.query_advice(
@@ -296,6 +303,11 @@ impl<F: Field> SubCircuitConfig<F> for TxCircuitConfig<F> {
             cb.gate(meta.query_fixed(q_enable, Rotation::cur()))
         });
 
+        // wenqing: determine when calldata lookup into rlp table
+        // when: 
+        // (1) tag is CallData
+        // and
+        // (2) tx_id is not 0
         meta.create_gate("calldata lookup into rlp table condition", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
@@ -303,6 +315,8 @@ impl<F: Field> SubCircuitConfig<F> for TxCircuitConfig<F> {
                 "condition",
                 and::expr([
                     is_data(meta),
+                    // wenqing: tx_id_is_zero is an IsEqualChip
+                    // its .is_equal_expression is the expr returned by this chip
                     not::expr(tx_id_is_zero.is_equal_expression.expr()),
                 ]),
                 meta.query_advice(
