@@ -18,9 +18,8 @@ use crate::{
     table::{AccountFieldTag, CallContextFieldTag},
     util::Expr,
 };
-use bus_mapping::circuit_input_builder::CopyDataType;
+use bus_mapping::{circuit_input_builder::CopyDataType, state_db::CodeDB};
 use eth_types::{Field, ToScalar, U256};
-use ethers_core::utils::keccak256;
 use halo2_proofs::{circuit::Value, plonk::Error};
 
 #[derive(Clone, Debug)]
@@ -64,14 +63,12 @@ impl<F: Field> ExecutionGadget<F> for ReturnRevertGadget<F> {
 
         let is_success = cb.call_context(None, CallContextFieldTag::IsSuccess);
         cb.require_boolean("is_success is boolean", is_success.expr());
-        /*
-        cb.require_equal(
-            "if is_success, opcode is RETURN. if not, opcode is REVERT",
-            opcode.expr(),
-            is_success.expr() * OpcodeId::RETURN.expr()
-                + not::expr(is_success.expr()) * OpcodeId::REVERT.expr(),
-        );
-        */
+        // cb.require_equal(
+        // "if is_success, opcode is RETURN. if not, opcode is REVERT",
+        // opcode.expr(),
+        // is_success.expr() * OpcodeId::RETURN.expr()
+        // + not::expr(is_success.expr()) * OpcodeId::REVERT.expr(),
+        // );
 
         // There are 4 cases non-mutually exclusive, A to D, to handle, depending on if
         // the call is, or is not, a create, root, or successful. See the specs at
@@ -126,7 +123,7 @@ impl<F: Field> ExecutionGadget<F> for ReturnRevertGadget<F> {
                     address.expr(),
                     AccountFieldTag::CodeHash,
                     code_hash.expr(),
-                    cb.empty_hash_rlc(),
+                    cb.empty_code_hash_rlc(),
                     Some(&mut reversion_info),
                 );
 
@@ -279,7 +276,7 @@ impl<F: Field> ExecutionGadget<F> for ReturnRevertGadget<F> {
             let values: Vec<_> = (3..3 + length.as_usize())
                 .map(|i| block.rws[step.rw_indices[i]].memory_value())
                 .collect();
-            let mut code_hash = keccak256(values);
+            let mut code_hash = CodeDB::hash(&values).to_fixed_bytes();
             code_hash.reverse();
             self.code_hash.assign(
                 region,
@@ -343,10 +340,11 @@ impl<F: Field> ExecutionGadget<F> for ReturnRevertGadget<F> {
 #[cfg(test)]
 mod test {
     use crate::test_util::CircuitTestBuilder;
-    use eth_types::geth_types::GethData;
     use eth_types::{
-        address, bytecode, evm_types::OpcodeId, geth_types::Account, Address, Bytecode, ToWord,
-        Word, U256,
+        address, bytecode,
+        evm_types::OpcodeId,
+        geth_types::{Account, GethData},
+        Address, Bytecode, ToWord, Word, U256,
     };
     use itertools::Itertools;
     use mock::{eth, TestContext, MOCK_ACCOUNTS};
@@ -354,16 +352,16 @@ mod test {
     const CALLEE_ADDRESS: Address = Address::repeat_byte(0xff);
     const CALLER_ADDRESS: Address = Address::repeat_byte(0x34);
 
-    fn callee_bytecode(is_return: bool, offset: u64, length: u64) -> Bytecode {
-        let memory_bytes = [0x60; 10];
+    fn callee_bytecode(is_return: bool, offset: u128, length: u64) -> Bytecode {
+        let memory_bytes = [0x60; 6];
         let memory_address = 0;
         let memory_value = Word::from_big_endian(&memory_bytes);
         let mut code = bytecode! {
-            PUSH10(memory_value)
+            PUSH6(memory_value)
             PUSH1(memory_address)
             MSTORE
             PUSH2(length)
-            PUSH2(32u64 - u64::try_from(memory_bytes.len()).unwrap() + offset)
+            PUSH17(Word::from(offset) + 32 - memory_bytes.len())
         };
         code.write_op(if is_return {
             OpcodeId::RETURN
@@ -655,5 +653,16 @@ mod test {
 
         let text_ctx = TestContext::<2, 1>::simple_ctx_with_bytecode(bytecode).unwrap();
         CircuitTestBuilder::new_from_test_ctx(text_ctx).run();
+    }
+
+    #[test]
+    fn test_return_overflow_offset_and_zero_length() {
+        for is_return in [true, false] {
+            let code = callee_bytecode(is_return, u128::MAX, 0);
+            CircuitTestBuilder::new_from_test_ctx(
+                TestContext::<2, 1>::simple_ctx_with_bytecode(code).unwrap(),
+            )
+            .run();
+        }
     }
 }

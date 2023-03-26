@@ -236,8 +236,7 @@ impl<F: Field> ExecutionGadget<F> for ExtcodecopyGadget<F> {
 
 #[cfg(test)]
 mod test {
-    use crate::evm_circuit::test::rand_bytes_array;
-    use crate::test_util::CircuitTestBuilder;
+    use crate::{evm_circuit::test::rand_bytes_array, test_util::CircuitTestBuilder};
     use eth_types::{
         address, bytecode, geth_types::Account, Address, Bytecode, Bytes, ToWord, Word,
     };
@@ -252,7 +251,7 @@ mod test {
     fn test_ok(
         external_account: Option<Account>,
         code_offset: Word,
-        memory_offset: usize,
+        memory_offset: Word,
         length: usize,
         is_warm: bool,
     ) {
@@ -312,8 +311,8 @@ mod test {
 
     #[test]
     fn extcodecopy_empty_account() {
-        test_ok(None, 0x00.into(), 0x00, 0x36, true); // warm account
-        test_ok(None, 0x00.into(), 0x00, 0x36, false); // cold account
+        test_ok(None, Word::zero(), Word::zero(), 0x36, true); // warm account
+        test_ok(None, Word::zero(), Word::zero(), 0x36, false); // cold account
     }
 
     #[test]
@@ -324,8 +323,8 @@ mod test {
                 code: Bytes::from([10, 40]),
                 ..Default::default()
             }),
-            0x00.into(),
-            0x00,
+            Word::zero(),
+            Word::zero(),
             0x36,
             true,
         ); // warm account
@@ -336,8 +335,8 @@ mod test {
                 code: Bytes::from([10, 40]),
                 ..Default::default()
             }),
-            0x00.into(),
-            0x00,
+            Word::zero(),
+            Word::zero(),
             0x36,
             false,
         ); // cold account
@@ -351,8 +350,8 @@ mod test {
                 code: Bytes::from(rand_bytes_array::<256>()),
                 ..Default::default()
             }),
-            0x00.into(),
-            0x00,
+            Word::zero(),
+            Word::zero(),
             0x36,
             true,
         );
@@ -362,8 +361,8 @@ mod test {
                 code: Bytes::from(rand_bytes_array::<256>()),
                 ..Default::default()
             }),
-            0x00.into(),
-            0x00,
+            Word::zero(),
+            Word::zero(),
             0x36,
             false,
         );
@@ -378,7 +377,7 @@ mod test {
                 ..Default::default()
             }),
             0x20.into(),
-            0x00,
+            Word::zero(),
             0x104,
             true,
         );
@@ -389,7 +388,7 @@ mod test {
                 ..Default::default()
             }),
             0x20.into(),
-            0x00,
+            Word::zero(),
             0x104,
             false,
         );
@@ -404,7 +403,7 @@ mod test {
                 ..Default::default()
             }),
             Word::MAX,
-            0x00,
+            Word::zero(),
             0x36,
             true,
         );
@@ -415,9 +414,35 @@ mod test {
                 ..Default::default()
             }),
             Word::MAX,
-            0x00,
+            Word::zero(),
             0x36,
             false,
+        );
+    }
+
+    #[test]
+    fn extcodecopy_overflow_memory_offset_and_zero_length() {
+        test_ok(
+            Some(Account {
+                address: *EXTERNAL_ADDRESS,
+                code: Bytes::from(rand_bytes_array::<256>()),
+                ..Default::default()
+            }),
+            0x20.into(),
+            Word::MAX,
+            0,
+            true,
+        );
+        test_ok(
+            Some(Account {
+                address: *EXTERNAL_ADDRESS,
+                code: Bytes::from(rand_bytes_array::<256>()),
+                ..Default::default()
+            }),
+            0x20.into(),
+            Word::MAX,
+            0,
+            true,
         );
     }
 }

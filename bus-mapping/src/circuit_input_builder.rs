@@ -12,21 +12,28 @@ mod transaction;
 
 use self::access::gen_state_access_trace;
 pub use self::block::BlockHead;
-use crate::error::Error;
-use crate::evm::opcodes::{gen_associated_ops, gen_begin_tx_ops, gen_end_tx_ops};
-use crate::operation::{CallContextField, Operation, RWCounter, StartOp, RW};
-use crate::rpc::GethClient;
-use crate::state_db::{self, CodeDB, StateDB};
+use crate::{
+    error::Error,
+    evm::opcodes::{gen_associated_ops, gen_begin_tx_ops, gen_end_tx_ops},
+    operation::{CallContextField, Operation, RWCounter, StartOp, RW},
+    rpc::GethClient,
+    state_db::{self, CodeDB, StateDB},
+};
 pub use access::{Access, AccessSet, AccessValue, CodeSource};
 pub use block::{Block, BlockContext};
 pub use call::{Call, CallContext, CallKind};
 use core::fmt::Debug;
-use eth_types::evm_types::{GasCost, OpcodeId};
-use eth_types::sign_types::{pk_bytes_le, pk_bytes_swap_endianness, SignData};
-use eth_types::{self, Address, GethExecStep, GethExecTrace, ToWord, Word, H256, U256};
-use eth_types::{geth_types, ToBigEndian};
-use ethers_core::k256::ecdsa::SigningKey;
-use ethers_core::types::{Bytes, NameOrAddress, Signature, TransactionRequest};
+use eth_types::{
+    self,
+    evm_types::OpcodeId,
+    geth_types,
+    sign_types::{pk_bytes_le, pk_bytes_swap_endianness, SignData},
+    Address, GethExecStep, GethExecTrace, ToBigEndian, ToWord, Word, H256, U256,
+};
+use ethers_core::{
+    k256::ecdsa::SigningKey,
+    types::{Bytes, NameOrAddress, Signature, TransactionRequest},
+};
 use ethers_providers::JsonRpcClient;
 pub use execution::{
     CopyDataType, CopyEvent, CopyStep, ExecState, ExecStep, ExpEvent, ExpStep, NumberOrHash,
@@ -37,8 +44,10 @@ use ethers_core::utils::keccak256;
 pub use input_state_ref::CircuitInputStateRef;
 use itertools::Itertools;
 use log::warn;
-use std::collections::{BTreeMap, HashMap};
-use std::iter;
+use std::{
+    collections::{BTreeMap, HashMap},
+    iter,
+};
 pub use transaction::{Transaction, TransactionContext};
 
 /// Circuit Setup Parameters
@@ -300,6 +309,7 @@ impl<'a> CircuitInputBuilder {
         };
 
         let total_rws = state.block_ctx.rwc.0 - 1;
+        let max_rws = if max_rws == 0 { total_rws + 2 } else { max_rws };
         // We need at least 1 extra Start row
         #[allow(clippy::int_plus_one)]
         {
@@ -354,14 +364,7 @@ impl<'a> CircuitInputBuilder {
         // - execution_state: BeginTx
         // - op: None
         // Generate BeginTx step
-        let mut begin_tx_step = gen_begin_tx_ops(&mut self.state_ref(&mut tx, &mut tx_ctx))?;
-        begin_tx_step.gas_cost = if geth_trace.struct_logs.is_empty() {
-            GasCost(geth_trace.gas.0)
-        } else {
-            GasCost(tx.gas - geth_trace.struct_logs[0].gas.0)
-        };
-        log::trace!("begin_tx_step {:?}", begin_tx_step);
-        tx.steps_mut().push(begin_tx_step);
+        gen_begin_tx_ops(&mut self.state_ref(&mut tx, &mut tx_ctx), geth_trace)?;
 
         for (index, geth_step) in geth_trace.struct_logs.iter().enumerate() {
             let mut state_ref = self.state_ref(&mut tx, &mut tx_ctx);
@@ -401,11 +404,15 @@ impl<'a> CircuitInputBuilder {
                     )
                 } else if geth_step.op.is_create() {
                     format!(
-                        "value {:?} offset {:?} size {:?} (salt {:?})",
+                        "value {:?} offset {:?} size {:?} {}",
                         geth_step.stack.nth_last(0),
                         geth_step.stack.nth_last(1),
                         geth_step.stack.nth_last(2),
-                        geth_step.stack.nth_last(3),
+                        if geth_step.op == OpcodeId::CREATE2 {
+                            format!("salt {:?}", geth_step.stack.nth_last(3))
+                        } else {
+                            "".to_string()
+                        }
                     )
                 } else if matches!(geth_step.op, OpcodeId::MLOAD) {
                     format!(
@@ -474,7 +481,7 @@ pub fn keccak_inputs(block: &Block, code_db: &CodeDB) -> Result<Vec<Vec<u8>>, Er
     ));
     // Bytecode Circuit
     for _bytecode in code_db.0.values() {
-        //keccak_inputs.push(bytecode.clone());
+        // keccak_inputs.push(bytecode.clone());
     }
     log::debug!(
         "keccak total len after bytecodes: {}",
@@ -680,10 +687,17 @@ pub fn get_create_init_code<'a>(
     call_ctx: &'a CallContext,
     step: &GethExecStep,
 ) -> Result<&'a [u8], Error> {
-    let offset = step.stack.nth_last(1)?;
-    let length = step.stack.nth_last(2)?;
-    Ok(&call_ctx.memory.0
-        [offset.low_u64() as usize..(offset.low_u64() + length.low_u64()) as usize])
+    let offset = step.stack.nth_last(1)?.low_u64() as usize;
+    let length = step.stack.nth_last(2)?.as_usize();
+
+    let mem_len = call_ctx.memory.0.len();
+    if offset >= mem_len {
+        return Ok(&[]);
+    }
+
+    let offset_end = offset.checked_add(length).unwrap_or(mem_len);
+
+    Ok(&call_ctx.memory.0[offset..offset_end])
 }
 
 /// Retrieve the memory offset and length of call.
@@ -785,7 +799,7 @@ impl<P: JsonRpcClient> BuilderClient<P> {
         let geth_traces = self.cli.trace_block_by_number(block_num.into()).await?;
 
         // fetch up to 256 blocks
-        let mut n_blocks = 0; //std::cmp::min(256, block_num as usize);
+        let mut n_blocks = 0; // std::cmp::min(256, block_num as usize);
         let mut next_hash = eth_block.parent_hash;
         let mut prev_state_root: Option<Word> = None;
         let mut history_hashes = vec![Word::default(); n_blocks];

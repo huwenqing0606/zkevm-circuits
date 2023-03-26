@@ -78,6 +78,7 @@ mod end_block;
 mod end_inner_block;
 mod end_tx;
 mod error_code_store;
+mod error_invalid_creation_code;
 mod error_invalid_jump;
 mod error_invalid_opcode;
 mod error_oog_call;
@@ -86,6 +87,7 @@ mod error_oog_dynamic_memory;
 mod error_oog_exp;
 mod error_oog_log;
 mod error_oog_memory_copy;
+mod error_oog_sha3;
 mod error_oog_sload_sstore;
 mod error_oog_static_memory;
 mod error_precompile_failed;
@@ -136,6 +138,7 @@ use balance::BalanceGadget;
 use begin_tx::BeginTxGadget;
 use bitwise::BitwiseGadget;
 use block_ctx::{BlockCtxU160Gadget, BlockCtxU256Gadget, BlockCtxU64Gadget};
+use blockhash::BlockHashGadget;
 use byte::ByteGadget;
 use calldatacopy::CallDataCopyGadget;
 use calldataload::CallDataLoadGadget;
@@ -154,6 +157,7 @@ use end_block::EndBlockGadget;
 use end_inner_block::EndInnerBlockGadget;
 use end_tx::EndTxGadget;
 use error_code_store::ErrorCodeStoreGadget;
+use error_invalid_creation_code::ErrorInvalidCreationCodeGadget;
 use error_invalid_jump::ErrorInvalidJumpGadget;
 use error_invalid_opcode::ErrorInvalidOpcodeGadget;
 use error_oog_call::ErrorOOGCallGadget;
@@ -162,6 +166,7 @@ use error_oog_dynamic_memory::ErrorOOGDynamicMemoryGadget;
 use error_oog_exp::ErrorOOGExpGadget;
 use error_oog_log::ErrorOOGLogGadget;
 use error_oog_memory_copy::ErrorOOGMemoryCopyGadget;
+use error_oog_sha3::ErrorOOGSha3Gadget;
 use error_oog_sload_sstore::ErrorOOGSloadSstoreGadget;
 use error_oog_static_memory::ErrorOOGStaticMemoryGadget;
 use error_precompile_failed::ErrorPrecompileFailedGadget;
@@ -243,98 +248,104 @@ pub(crate) struct ExecutionConfig<F> {
     stored_expressions_map: HashMap<ExecutionState, Vec<StoredExpression<F>>>,
     instrument: Instrument,
     // internal state gadgets
-    begin_tx_gadget: BeginTxGadget<F>,
-    end_block_gadget: EndBlockGadget<F>,
-    end_inner_block_gadget: EndInnerBlockGadget<F>,
-    end_tx_gadget: EndTxGadget<F>,
+    begin_tx_gadget: Box<BeginTxGadget<F>>,
+    end_block_gadget: Box<EndBlockGadget<F>>,
+    end_inner_block_gadget: Box<EndInnerBlockGadget<F>>,
+    end_tx_gadget: Box<EndTxGadget<F>>,
     // opcode gadgets
-    add_sub_gadget: AddSubGadget<F>,
-    addmod_gadget: AddModGadget<F>,
-    address_gadget: AddressGadget<F>,
-    balance_gadget: BalanceGadget<F>,
-    bitwise_gadget: BitwiseGadget<F>,
-    byte_gadget: ByteGadget<F>,
-    call_op_gadget: CallOpGadget<F>,
-    call_value_gadget: CallValueGadget<F>,
-    calldatacopy_gadget: CallDataCopyGadget<F>,
-    calldataload_gadget: CallDataLoadGadget<F>,
-    calldatasize_gadget: CallDataSizeGadget<F>,
-    caller_gadget: CallerGadget<F>,
-    chainid_gadget: ChainIdGadget<F>,
-    codecopy_gadget: CodeCopyGadget<F>,
-    codesize_gadget: CodesizeGadget<F>,
-    comparator_gadget: ComparatorGadget<F>,
-    dup_gadget: DupGadget<F>,
-    exp_gadget: ExponentiationGadget<F>,
-    extcodehash_gadget: ExtcodehashGadget<F>,
-    extcodesize_gadget: ExtcodesizeGadget<F>,
-    extcodecopy_gadget: ExtcodecopyGadget<F>,
-    gas_gadget: GasGadget<F>,
-    gasprice_gadget: GasPriceGadget<F>,
-    iszero_gadget: IsZeroGadget<F>,
-    jump_gadget: JumpGadget<F>,
-    jumpdest_gadget: JumpdestGadget<F>,
-    jumpi_gadget: JumpiGadget<F>,
-    log_gadget: LogGadget<F>,
-    memory_gadget: MemoryGadget<F>,
-    msize_gadget: MsizeGadget<F>,
-    mul_div_mod_gadget: MulDivModGadget<F>,
-    mulmod_gadget: MulModGadget<F>,
-    not_gadget: NotGadget<F>,
-    origin_gadget: OriginGadget<F>,
-    pc_gadget: PcGadget<F>,
-    pop_gadget: PopGadget<F>,
-    push_gadget: PushGadget<F>,
-    return_revert_gadget: ReturnRevertGadget<F>,
-    sar_gadget: SarGadget<F>,
-    sdiv_smod_gadget: SignedDivModGadget<F>,
-    selfbalance_gadget: SelfbalanceGadget<F>,
-    sha3_gadget: Sha3Gadget<F>,
-    shl_shr_gadget: ShlShrGadget<F>,
-    returndatasize_gadget: ReturnDataSizeGadget<F>,
-    returndatacopy_gadget: ReturnDataCopyGadget<F>,
-    create_gadget: CreateGadget<F>,
-    selfdestruct_gadget: DummyGadget<F, 1, 0, { ExecutionState::SELFDESTRUCT }>,
-    signed_comparator_gadget: SignedComparatorGadget<F>,
-    signextend_gadget: SignextendGadget<F>,
-    sload_gadget: SloadGadget<F>,
-    sstore_gadget: SstoreGadget<F>,
-    stop_gadget: StopGadget<F>,
-    swap_gadget: SwapGadget<F>,
-    blockhash_gadget: DummyGadget<F, 1, 1, { ExecutionState::BLOCKHASH }>,
-    block_ctx_u64_gadget: BlockCtxU64Gadget<F>,
-    block_ctx_u160_gadget: BlockCtxU160Gadget<F>,
-    block_ctx_u256_gadget: BlockCtxU256Gadget<F>,
+    add_sub_gadget: Box<AddSubGadget<F>>,
+    addmod_gadget: Box<AddModGadget<F>>,
+    address_gadget: Box<AddressGadget<F>>,
+    balance_gadget: Box<BalanceGadget<F>>,
+    bitwise_gadget: Box<BitwiseGadget<F>>,
+    byte_gadget: Box<ByteGadget<F>>,
+    call_op_gadget: Box<CallOpGadget<F>>,
+    call_value_gadget: Box<CallValueGadget<F>>,
+    calldatacopy_gadget: Box<CallDataCopyGadget<F>>,
+    calldataload_gadget: Box<CallDataLoadGadget<F>>,
+    calldatasize_gadget: Box<CallDataSizeGadget<F>>,
+    caller_gadget: Box<CallerGadget<F>>,
+    chainid_gadget: Box<ChainIdGadget<F>>,
+    codecopy_gadget: Box<CodeCopyGadget<F>>,
+    codesize_gadget: Box<CodesizeGadget<F>>,
+    comparator_gadget: Box<ComparatorGadget<F>>,
+    dup_gadget: Box<DupGadget<F>>,
+    exp_gadget: Box<ExponentiationGadget<F>>,
+    extcodehash_gadget: Box<ExtcodehashGadget<F>>,
+    extcodesize_gadget: Box<ExtcodesizeGadget<F>>,
+    extcodecopy_gadget: Box<ExtcodecopyGadget<F>>,
+    gas_gadget: Box<GasGadget<F>>,
+    gasprice_gadget: Box<GasPriceGadget<F>>,
+    iszero_gadget: Box<IsZeroGadget<F>>,
+    jump_gadget: Box<JumpGadget<F>>,
+    jumpdest_gadget: Box<JumpdestGadget<F>>,
+    jumpi_gadget: Box<JumpiGadget<F>>,
+    log_gadget: Box<LogGadget<F>>,
+    memory_gadget: Box<MemoryGadget<F>>,
+    msize_gadget: Box<MsizeGadget<F>>,
+    mul_div_mod_gadget: Box<MulDivModGadget<F>>,
+    mulmod_gadget: Box<MulModGadget<F>>,
+    not_gadget: Box<NotGadget<F>>,
+    origin_gadget: Box<OriginGadget<F>>,
+    pc_gadget: Box<PcGadget<F>>,
+    pop_gadget: Box<PopGadget<F>>,
+    push_gadget: Box<PushGadget<F>>,
+    return_revert_gadget: Box<ReturnRevertGadget<F>>,
+    sar_gadget: Box<SarGadget<F>>,
+    sdiv_smod_gadget: Box<SignedDivModGadget<F>>,
+    selfbalance_gadget: Box<SelfbalanceGadget<F>>,
+    sha3_gadget: Box<Sha3Gadget<F>>,
+    shl_shr_gadget: Box<ShlShrGadget<F>>,
+    returndatasize_gadget: Box<ReturnDataSizeGadget<F>>,
+    returndatacopy_gadget: Box<ReturnDataCopyGadget<F>>,
+    create_gadget: Box<CreateGadget<F>>,
+    selfdestruct_gadget: Box<DummyGadget<F, 1, 0, { ExecutionState::SELFDESTRUCT }>>,
+    signed_comparator_gadget: Box<SignedComparatorGadget<F>>,
+    signextend_gadget: Box<SignextendGadget<F>>,
+    sload_gadget: Box<SloadGadget<F>>,
+    sstore_gadget: Box<SstoreGadget<F>>,
+    stop_gadget: Box<StopGadget<F>>,
+    swap_gadget: Box<SwapGadget<F>>,
+    blockhash_gadget: Box<BlockHashGadget<F>>,
+    block_ctx_u64_gadget: Box<BlockCtxU64Gadget<F>>,
+    block_ctx_u160_gadget: Box<BlockCtxU160Gadget<F>>,
+    block_ctx_u256_gadget: Box<BlockCtxU256Gadget<F>>,
     // error gadgets
-    error_oog_call: ErrorOOGCallGadget<F>,
-    error_oog_constant: ErrorOOGConstantGadget<F>,
-    error_oog_exp: ErrorOOGExpGadget<F>,
-    error_oog_memory_copy: ErrorOOGMemoryCopyGadget<F>,
-    error_oog_sload_sstore: ErrorOOGSloadSstoreGadget<F>,
-    error_oog_static_memory_gadget: ErrorOOGStaticMemoryGadget<F>,
-    error_stack: ErrorStackGadget<F>,
-    error_write_protection: ErrorWriteProtectionGadget<F>,
-    error_oog_dynamic_memory_gadget: ErrorOOGDynamicMemoryGadget<F>,
-    error_oog_log: ErrorOOGLogGadget<F>,
-    error_oog_account_access: DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasAccountAccess }>,
-    error_oog_sha3: DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasSHA3 }>,
-    error_oog_ext_codecopy: DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasEXTCODECOPY }>,
-    error_oog_create2: DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasCREATE2 }>,
-    error_oog_self_destruct: DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasSELFDESTRUCT }>,
-    error_code_store: ErrorCodeStoreGadget<F>,
-    error_insufficient_balance: DummyGadget<F, 0, 0, { ExecutionState::ErrorInsufficientBalance }>,
-    error_invalid_jump: ErrorInvalidJumpGadget<F>,
-    error_invalid_opcode: ErrorInvalidOpcodeGadget<F>,
-    error_depth: DummyGadget<F, 0, 0, { ExecutionState::ErrorDepth }>,
+    error_oog_call: Box<ErrorOOGCallGadget<F>>,
+    error_oog_constant: Box<ErrorOOGConstantGadget<F>>,
+    error_oog_exp: Box<ErrorOOGExpGadget<F>>,
+    error_oog_memory_copy: Box<ErrorOOGMemoryCopyGadget<F>>,
+    error_oog_sload_sstore: Box<ErrorOOGSloadSstoreGadget<F>>,
+    error_oog_static_memory_gadget: Box<ErrorOOGStaticMemoryGadget<F>>,
+    error_stack: Box<ErrorStackGadget<F>>,
+    error_write_protection: Box<ErrorWriteProtectionGadget<F>>,
+    error_oog_dynamic_memory_gadget: Box<ErrorOOGDynamicMemoryGadget<F>>,
+    error_oog_log: Box<ErrorOOGLogGadget<F>>,
+    error_oog_account_access:
+        Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasAccountAccess }>>,
+    error_oog_sha3: Box<ErrorOOGSha3Gadget<F>>,
+    error_oog_create2: Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasCREATE2 }>>,
+    error_code_store: Box<ErrorCodeStoreGadget<F>>,
+    error_oog_self_destruct:
+        Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasSELFDESTRUCT }>>,
+    error_insufficient_balance:
+        Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorInsufficientBalance }>>,
+    error_nonce_uint_overflow:
+        Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorNonceUintOverflow }>>,
+    error_invalid_jump: Box<ErrorInvalidJumpGadget<F>>,
+    error_invalid_opcode: Box<ErrorInvalidOpcodeGadget<F>>,
+    error_depth: Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorDepth }>>,
     error_contract_address_collision:
-        DummyGadget<F, 0, 0, { ExecutionState::ErrorContractAddressCollision }>,
-    error_invalid_creation_code: DummyGadget<F, 0, 0, { ExecutionState::ErrorInvalidCreationCode }>,
-    error_return_data_out_of_bound: ErrorReturnDataOutOfBoundGadget<F>,
-    error_precompile_failed: ErrorPrecompileFailedGadget<F>,
+        Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorContractAddressCollision }>>,
+    error_invalid_creation_code: Box<ErrorInvalidCreationCodeGadget<F>>,
+    error_precompile_failed: Box<ErrorPrecompileFailedGadget<F>>,
+    error_return_data_out_of_bound: Box<ErrorReturnDataOutOfBoundGadget<F>>,
+    error_gas_uint_overflow: Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorGasUintOverflow }>>,
 }
 
 impl<F: Field> ExecutionConfig<F> {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::redundant_closure_call)]
     pub(crate) fn configure(
         meta: &mut ConstraintSystem<F>,
         challenges: Challenges<Expression<F>>,
@@ -470,20 +481,27 @@ impl<F: Field> ExecutionConfig<F> {
 
         macro_rules! configure_gadget {
             () => {
-                Self::configure_gadget(
-                    meta,
-                    advices,
-                    q_usable,
-                    q_step,
-                    num_rows_until_next_step,
-                    q_step_first,
-                    q_step_last,
-                    &challenges,
-                    &step_curr,
-                    &mut height_map,
-                    &mut stored_expressions_map,
-                    &mut instrument,
-                )
+                // We create each gadget in a closure so that the stack required to hold
+                // the gadget value before being copied to the box is freed immediately after
+                // the boxed gadget is returned.
+                // We put each gadget in a box so that they stay in the heap to keep
+                // ExecutionConfig at a managable size.
+                (|| {
+                    Box::new(Self::configure_gadget(
+                        meta,
+                        advices,
+                        q_usable,
+                        q_step,
+                        num_rows_until_next_step,
+                        q_step_first,
+                        q_step_last,
+                        &challenges,
+                        &step_curr,
+                        &mut height_map,
+                        &mut stored_expressions_map,
+                        &mut instrument,
+                    ))
+                })()
             };
         }
 
@@ -572,7 +590,6 @@ impl<F: Field> ExecutionConfig<F> {
             error_oog_memory_copy: configure_gadget!(),
             error_oog_account_access: configure_gadget!(),
             error_oog_sha3: configure_gadget!(),
-            error_oog_ext_codecopy: configure_gadget!(),
             error_oog_exp: configure_gadget!(),
             error_oog_create2: configure_gadget!(),
             error_oog_self_destruct: configure_gadget!(),
@@ -582,10 +599,12 @@ impl<F: Field> ExecutionConfig<F> {
             error_invalid_opcode: configure_gadget!(),
             error_write_protection: configure_gadget!(),
             error_depth: configure_gadget!(),
+            error_nonce_uint_overflow: configure_gadget!(),
             error_contract_address_collision: configure_gadget!(),
             error_invalid_creation_code: configure_gadget!(),
             error_return_data_out_of_bound: configure_gadget!(),
             error_precompile_failed: configure_gadget!(),
+            error_gas_uint_overflow: configure_gadget!(),
             // step and presets
             step: step_curr,
             height_map,
@@ -1228,16 +1247,6 @@ impl<F: Field> ExecutionConfig<F> {
         next: Option<(&Transaction, &Call, &ExecStep)>,
         challenges: &Challenges<Value<F>>,
     ) -> Result<(), Error> {
-        if !(matches!(step.execution_state, ExecutionState::EndBlock) && step.rw_indices.is_empty())
-        {
-            log::trace!(
-                "assign_exec_step offset: {} state {:?} step: {:?} call: {:?}",
-                offset,
-                step.execution_state,
-                step,
-                call
-            );
-        }
         // Make the region large enough for the current step and the next step.
         // The next step's next step may also be accessed, so make the region large
         // enough for 3 steps.
@@ -1261,11 +1270,11 @@ impl<F: Field> ExecutionConfig<F> {
                 transaction_next,
                 call_next,
                 step_next,
-                false,
+                true,
             )?;
         }
 
-        self.assign_exec_step_int(region, offset, block, transaction, call, step, true)
+        self.assign_exec_step_int(region, offset, block, transaction, call, step, false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1277,8 +1286,21 @@ impl<F: Field> ExecutionConfig<F> {
         transaction: &Transaction,
         call: &Call,
         step: &ExecStep,
-        check_rw: bool,
+        verbose: bool,
     ) -> Result<(), Error> {
+        if verbose
+            && !(matches!(step.execution_state, ExecutionState::EndBlock)
+                && step.rw_indices.is_empty())
+        {
+            log::trace!(
+                "assign_exec_step offset: {} state {:?} step: {:?} call: {:?}",
+                offset,
+                step.execution_state,
+                step,
+                call
+            );
+        }
+
         self.step
             .assign_exec_step(region, offset, block, transaction, call, step)?;
 
@@ -1382,9 +1404,6 @@ impl<F: Field> ExecutionConfig<F> {
             ExecutionState::ErrorOutOfGasSHA3 => {
                 assign_exec_step!(self.error_oog_sha3)
             }
-            ExecutionState::ErrorOutOfGasEXTCODECOPY => {
-                assign_exec_step!(self.error_oog_ext_codecopy)
-            }
             ExecutionState::ErrorOutOfGasEXP => {
                 assign_exec_step!(self.error_oog_exp)
             }
@@ -1417,6 +1436,9 @@ impl<F: Field> ExecutionConfig<F> {
             ExecutionState::ErrorDepth => {
                 assign_exec_step!(self.error_depth)
             }
+            ExecutionState::ErrorNonceUintOverflow => {
+                assign_exec_step!(self.error_nonce_uint_overflow)
+            }
             ExecutionState::ErrorContractAddressCollision => {
                 assign_exec_step!(self.error_contract_address_collision)
             }
@@ -1429,13 +1451,16 @@ impl<F: Field> ExecutionConfig<F> {
             ExecutionState::ErrorPrecompileFailed => {
                 assign_exec_step!(self.error_precompile_failed)
             }
+            ExecutionState::ErrorGasUintOverflow => {
+                assign_exec_step!(self.error_gas_uint_overflow)
+            }
         }
 
         // Fill in the witness values for stored expressions
         let assigned_stored_expressions = self.assign_stored_expressions(region, offset, step)?;
 
         // enable with `CHECK_RW_LOOKUP=true`
-        if *CHECK_RW_LOOKUP && check_rw {
+        if *CHECK_RW_LOOKUP && verbose {
             let is_padding_step = matches!(step.execution_state, ExecutionState::EndBlock)
                 && step.rw_indices.is_empty();
             if !is_padding_step {
@@ -1608,7 +1633,7 @@ impl<F: Field> ExecutionConfig<F> {
                     rw,
                     rw_idx, idx);
 
-                //debug_assert_eq!(
+                // debug_assert_eq!(
                 //    rlc, assigned_rw_values[idx].1,
                 //    "left is witness, right is expression"
                 //);

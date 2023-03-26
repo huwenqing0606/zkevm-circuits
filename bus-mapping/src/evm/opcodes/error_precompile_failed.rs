@@ -1,9 +1,10 @@
-use crate::circuit_input_builder::{CircuitInputStateRef, ExecStep};
-use crate::error::ExecError;
-use crate::evm::Opcode;
-use crate::Error;
-use eth_types::evm_types::OpcodeId;
-use eth_types::GethExecStep;
+use crate::{
+    circuit_input_builder::{CircuitInputStateRef, ExecStep},
+    error::ExecError,
+    evm::Opcode,
+    Error,
+};
+use eth_types::{evm_types::OpcodeId, GethExecStep};
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct PrecompileFailed;
@@ -30,6 +31,10 @@ impl Opcode for PrecompileFailed {
 
         // we need to keep the memory until parse_call complete
         state.call_expand_memory(args_offset, args_length, ret_offset, ret_length)?;
+
+        let call = state.parse_call(geth_step)?;
+        state.push_call(call);
+        state.handle_return(geth_step)?;
 
         for i in 0..stack_input_num {
             state.stack_read(
