@@ -1197,7 +1197,7 @@ impl<F: Field> TxCircuitConfig<F> {
             .collect()
         });
 
-        // lookup tx calldata bytes in RLP table for TxSign.
+        // lookup tx calldata bytes in RLP table for TxHash.
         meta.lookup_any("tx calldata::index in RLP Table::TxHash", |meta| {
             let enable = and::expr(vec![
                 meta.query_fixed(q_enable, Rotation::cur()),
