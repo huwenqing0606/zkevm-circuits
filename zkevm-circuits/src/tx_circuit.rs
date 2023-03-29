@@ -1446,7 +1446,7 @@ impl<F: Field> TxCircuit<F> {
                 // Empty entry
                 config.assign_row(
                     &mut region,
-                    &mut offset,
+                    &mut offset,    // wenqing: offset will +1 after assign_row
                     0,                         // tx_id
                     !sigs.is_empty() as usize, // tx_id_next
                     TxFieldTag::Null,
@@ -1645,7 +1645,8 @@ impl<F: Field> TxCircuit<F> {
                                         || "sv_address == SignVerify.address",
                                         &mut region,
                                         config.sv_address,
-                                        offset - 1,
+                                        offset - 1, /* offset is increased by 1
+                                                            * inside assign_row */
                                     )?;
                                 }
                                 #[cfg(not(feature = "enable-sign-verify"))]
