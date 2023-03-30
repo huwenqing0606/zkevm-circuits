@@ -546,12 +546,16 @@ impl<F: Field> SignVerifyChip<F> {
         // log::trace!("pk hash rlc halo2ecc: {:?}", pk_hash_rlc.value());
 
         Ok((
-            [
+            [   
+                // wenqing: this piece of info is keccak_lookup enabled
+                // but not constrained within the sign_verify_chip context
                 sign_data_decomposed.is_address_zero.clone(),
                 pk_rlc,
                 pk_hash_rlc,
             ],
-            AssignedSignatureVerify {
+            AssignedSignatureVerify { 
+                // wenqing: this piece of info will be further constrained 
+                // in the tx circuit 
                 address: sign_data_decomposed.address.clone(),
                 msg_len: sign_data.msg.len(),
                 msg_rlc: challenges
@@ -687,6 +691,8 @@ impl<F: Field> SignVerifyChip<F> {
                     let [is_address_zero, pk_rlc, pk_hash_rlc] = e;
 
                     self.enable_keccak_lookup(
+                        // wenqing: this only enables keccak lookup but need 
+                        // to find the actual place where lookup is done
                         config,
                         &mut ctx,
                         is_address_zero,
