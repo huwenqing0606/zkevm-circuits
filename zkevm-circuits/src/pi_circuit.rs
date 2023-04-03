@@ -549,6 +549,9 @@ impl<F: Field> PiCircuitConfig<F> {
         pi_constants.extend_from_slice(&COINBASE.to_fixed_bytes()[..]);
         pi_constants.extend_from_slice(&DIFFICULTY.to_be_bytes()[..]);
 
+        // wenqing:
+        // log::info!("pi_constants {:}", pi_constants);
+
         let pi_constants = pi_constants
             .into_iter()
             .enumerate()
