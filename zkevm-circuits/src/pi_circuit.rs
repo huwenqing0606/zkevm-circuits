@@ -736,7 +736,7 @@ impl<F: Field> PiCircuitConfig<F> {
                 &mut rpi_rlc_acc,
                 &mut rpi_length_acc,
                 true,
-                is_rpi_padding,
+                is_rpi_padding, // wenqing: circular naming between skip_for_keccak and is_rpi_padding
                 challenges,
                 false,
             )?;
@@ -1341,6 +1341,7 @@ impl<F: Field> SubCircuit<F> for PiCircuit<F> {
 
         // Constrain raw_public_input cells to public inputs
         for (i, pi_cell) in pi_cells.iter().enumerate() {
+            // wenqing: where is pi column assigned witness?
             layouter.constrain_instance(pi_cell.cell(), config.pi, i)?;
         }
 
