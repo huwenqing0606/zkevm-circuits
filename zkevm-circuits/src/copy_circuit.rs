@@ -1,5 +1,7 @@
-//! The Copy circuit implements constraints and lookups for read-write steps for
-//! copied bytes while execution opcodes such as CALLDATACOPY, CODECOPY, LOGS,
+//! The Copy circuit implements constraints and lookups for read-write 
+//! steps for copied bytes while executing 
+//! (wenqing: was "execution") opcodes 
+//! such as CALLDATACOPY, CODECOPY, LOGS,
 //! etc.
 
 use bus_mapping::circuit_input_builder::{CopyDataType, CopyEvent, NumberOrHash};
