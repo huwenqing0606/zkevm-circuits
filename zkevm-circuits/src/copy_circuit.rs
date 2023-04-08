@@ -367,6 +367,7 @@ impl<F: Field> SubCircuitConfig<F> for CopyCircuitConfig<F> {
         meta.lookup_any("TxLog lookup", |meta| {
             let cond = meta.query_fixed(q_enable, Rotation::cur())
                 * tag.value_equals(CopyDataType::TxLog, Rotation::cur())(meta);
+            // wenqing: why not excluding padding here?
             vec![
                 meta.query_advice(rw_counter, Rotation::cur()),
                 1.expr(),
