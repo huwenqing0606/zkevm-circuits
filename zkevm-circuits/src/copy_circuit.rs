@@ -275,6 +275,9 @@ impl<F: Field> SubCircuitConfig<F> for CopyCircuitConfig<F> {
                     * (not::expr(tag.value_equals(CopyDataType::Padding, Rotation::cur())(
                         meta,
                     ))),
+                    // wenqing: what is relation between is_pad and tag==CopyDataType::Padding?
+                    // answer: is_pad is for padding with in a copy event where src_addr >= src_addr_end
+                    // tag==CopyDataType::Padding is at the end of all copy events in circuit
                 |cb| {
                     cb.require_equal(
                         "bytes_left == bytes_left_next + 1 for non-last step",
@@ -368,6 +371,7 @@ impl<F: Field> SubCircuitConfig<F> for CopyCircuitConfig<F> {
             let cond = meta.query_fixed(q_enable, Rotation::cur())
                 * tag.value_equals(CopyDataType::TxLog, Rotation::cur())(meta);
             // wenqing: why not excluding padding here?
+            // answer: because is_pad never will be 1 for TxLog type copy
             vec![
                 meta.query_advice(rw_counter, Rotation::cur()),
                 1.expr(),
