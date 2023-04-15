@@ -1,9 +1,9 @@
 //! Table definitions used cross-circuits
 
 use crate::{
-    copy_circuit::number_or_hash_to_field,
+    copy_circuit::util::number_or_hash_to_field,
     evm_circuit::util::rlc,
-    exp_circuit::{OFFSET_INCREMENT, ROWS_PER_STEP},
+    exp_circuit::param::{OFFSET_INCREMENT, ROWS_PER_STEP},
     impl_expr,
     util::{build_tx_log_address, Challenges},
     witness::{
@@ -13,7 +13,7 @@ use crate::{
 };
 use bus_mapping::circuit_input_builder::{CopyDataType, CopyEvent, CopyStep, ExpEvent};
 use core::iter::once;
-use eth_types::{Field, ToLittleEndian, ToScalar, Word, U256};
+use eth_types::{Field, ToLittleEndian, ToScalar, ToWord, Word, U256};
 use gadgets::{
     binary_number::{BinaryNumberChip, BinaryNumberConfig},
     util::{split_u256, split_u256_limb64},
@@ -365,12 +365,17 @@ impl From<RwTableTag> for usize {
 /// Tag for an AccountField in RwTable
 #[derive(Clone, Copy, Debug, EnumIter, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AccountFieldTag {
+    /// Variant representing the poseidon hash of an account's code.
+    CodeHash = 0, /* we need this to match to the field tag of AccountStorage, which is
+                   * always 0 */
     /// Nonce field
-    Nonce = 1,
+    Nonce,
     /// Balance field
     Balance,
-    /// CodeHash field
-    CodeHash,
+    /// Variant representing the keccak hash of an account's code.
+    KeccakCodeHash,
+    /// Variant representing the code size, i.e. length of account's code.
+    CodeSize,
     /// NonExisting field
     NonExisting,
 }
@@ -599,8 +604,12 @@ pub enum MPTProofType {
     NonceMod = AccountFieldTag::Nonce as isize,
     /// Balance updated
     BalanceMod = AccountFieldTag::Balance as isize,
-    /// Code hash exists
-    CodeHashMod = AccountFieldTag::CodeHash as isize,
+    /// Keccak Code hash exists
+    KeccakCodeHashExists = AccountFieldTag::KeccakCodeHash as isize,
+    /// Poseidon Code hash exits
+    PoseidonCodeHashExists = AccountFieldTag::CodeHash as isize,
+    /// Code size exists
+    CodeSizeExists = AccountFieldTag::CodeSize as isize,
     /// Account does not exist
     NonExistingAccountProof = AccountFieldTag::NonExisting as isize,
     /// Storage updated
@@ -615,8 +624,10 @@ impl From<AccountFieldTag> for MPTProofType {
         match tag {
             AccountFieldTag::Nonce => Self::NonceMod,
             AccountFieldTag::Balance => Self::BalanceMod,
-            AccountFieldTag::CodeHash => Self::CodeHashMod,
+            AccountFieldTag::KeccakCodeHash => Self::KeccakCodeHashExists,
+            AccountFieldTag::CodeHash => Self::PoseidonCodeHashExists,
             AccountFieldTag::NonExisting => Self::NonExistingAccountProof,
+            AccountFieldTag::CodeSize => Self::CodeSizeExists,
         }
     }
 }
@@ -781,11 +792,12 @@ impl PoseidonTable {
         &self,
         layouter: &mut impl Layouter<F>,
         inputs: impl IntoIterator<Item = &'a Vec<u8>> + Clone,
-        challenges: &Challenges<Value<F>>,
     ) -> Result<(), Error> {
         use crate::bytecode_circuit::bytecode_unroller::{
             unroll_to_hash_input_default, HASHBLOCK_BYTES_IN_FIELD,
         };
+        use bus_mapping::state_db::CodeDB;
+        use mpt_zktrie::hash::HASHABLE_DOMAIN_SPEC;
 
         layouter.assign_region(
             || "poseidon table",
@@ -802,7 +814,8 @@ impl PoseidonTable {
                     )?;
                 }
                 offset += 1;
-                let nil_hash = KeccakTable::assignments(&[], challenges)[0][3];
+                let nil_hash =
+                    Value::known(CodeDB::empty_code_hash().to_word().to_scalar().unwrap());
                 for (column, value) in poseidon_table_columns
                     .iter()
                     .copied()
@@ -820,7 +833,12 @@ impl PoseidonTable {
                 for input in inputs.clone() {
                     let mut control_len = input.len();
                     let mut first_row = true;
-                    let ref_hash = KeccakTable::assignments(input, challenges)[0][3];
+                    let ref_hash = Value::known(
+                        CodeDB::hash(input.as_slice())
+                            .to_word()
+                            .to_scalar()
+                            .unwrap(),
+                    );
                     for row in unroll_to_hash_input_default::<F>(input.iter().copied()) {
                         assert_ne!(
                             control_len,
@@ -829,11 +847,13 @@ impl PoseidonTable {
                             input.len()
                         );
                         let block_size = HASHBLOCK_BYTES_IN_FIELD * row.len();
+                        let control_len_as_flag =
+                            F::from_u128(HASHABLE_DOMAIN_SPEC * control_len as u128);
 
                         for (column, value) in poseidon_table_columns.iter().zip_eq(
                             once(ref_hash)
                                 .chain(row.map(Value::known))
-                                .chain(once(Value::known(F::from(control_len as u64))))
+                                .chain(once(Value::known(control_len_as_flag)))
                                 .chain(once(Value::known(if first_row {
                                     F::one()
                                 } else {
@@ -881,6 +901,8 @@ impl_expr!(BytecodeFieldTag);
 /// Table with Bytecode indexed by its Code Hash
 #[derive(Clone, Debug)]
 pub struct BytecodeTable {
+    /// Is Enabled
+    pub q_enable: Column<Fixed>,
     /// Code Hash
     pub code_hash: Column<Advice>,
     /// Tag
@@ -899,6 +921,7 @@ impl BytecodeTable {
         let [tag, index, is_code, value] = array::from_fn(|_| meta.advice_column());
         let code_hash = meta.advice_column_in(SecondPhase);
         Self {
+            q_enable: meta.fixed_column(),
             code_hash,
             tag,
             index,
@@ -909,7 +932,7 @@ impl BytecodeTable {
 
     /// Assign the `BytecodeTable` from a list of bytecodes, following the same
     /// table layout that the Bytecode Circuit uses.
-    pub fn load<'a, F: Field>(
+    pub fn dev_load<'a, F: Field>(
         &self,
         layouter: &mut impl Layouter<F>,
         bytecodes: impl IntoIterator<Item = &'a Bytecode> + Clone,
@@ -919,6 +942,13 @@ impl BytecodeTable {
             || "bytecode table",
             |mut region| {
                 let mut offset = 0;
+
+                region.assign_fixed(
+                    || "bytecode table all-zero row",
+                    self.q_enable,
+                    offset,
+                    || Value::known(F::one()),
+                )?;
                 for column in <BytecodeTable as LookupTable<F>>::advice_columns(self) {
                     region.assign_advice(
                         || "bytecode table all-zero row",
@@ -933,6 +963,12 @@ impl BytecodeTable {
                     <BytecodeTable as LookupTable<F>>::advice_columns(self);
                 for bytecode in bytecodes.clone() {
                     for row in bytecode.table_assignments(challenges) {
+                        region.assign_fixed(
+                            || format!("bytecode table row {}", offset),
+                            self.q_enable,
+                            offset,
+                            || Value::known(F::one()),
+                        )?;
                         for (&column, value) in bytecode_table_columns.iter().zip_eq(row) {
                             region.assign_advice(
                                 || format!("bytecode table row {}", offset),
@@ -953,6 +989,7 @@ impl BytecodeTable {
 impl<F: Field> LookupTable<F> for BytecodeTable {
     fn columns(&self) -> Vec<Column<Any>> {
         vec![
+            self.q_enable.into(),
             self.code_hash.into(),
             self.tag.into(),
             self.index.into(),
@@ -963,6 +1000,7 @@ impl<F: Field> LookupTable<F> for BytecodeTable {
 
     fn annotations(&self) -> Vec<String> {
         vec![
+            String::from("q_enable"),
             String::from("code_hash"),
             String::from("tag"),
             String::from("index"),
@@ -1103,7 +1141,9 @@ impl<F: Field> LookupTable<F> for BlockTable {
 #[derive(Clone, Debug)]
 pub struct KeccakTable {
     /// True when the row is enabled
-    pub is_enabled: Column<Advice>,
+    pub q_enable: Column<Fixed>,
+    /// True when the row is final
+    pub is_final: Column<Advice>,
     /// Byte array input as `RLC(reversed(input))`
     pub input_rlc: Column<Advice>, // RLC of input bytes
     /// Byte array input length
@@ -1115,7 +1155,8 @@ pub struct KeccakTable {
 impl<F: Field> LookupTable<F> for KeccakTable {
     fn columns(&self) -> Vec<Column<Any>> {
         vec![
-            self.is_enabled.into(),
+            self.q_enable.into(),
+            self.is_final.into(),
             self.input_rlc.into(),
             self.input_len.into(),
             self.output_rlc.into(),
@@ -1124,7 +1165,8 @@ impl<F: Field> LookupTable<F> for KeccakTable {
 
     fn annotations(&self) -> Vec<String> {
         vec![
-            String::from("is_enabled"),
+            String::from("q_enable"),
+            String::from("is_final"),
             String::from("input_rlc"),
             String::from("input_len"),
             String::from("output_rlc"),
@@ -1136,7 +1178,8 @@ impl KeccakTable {
     /// Construct a new KeccakTable
     pub fn construct<F: Field>(meta: &mut ConstraintSystem<F>) -> Self {
         Self {
-            is_enabled: meta.advice_column(),
+            q_enable: meta.fixed_column(),
+            is_final: meta.advice_column(),
             input_rlc: meta.advice_column_in(SecondPhase),
             input_len: meta.advice_column(),
             output_rlc: meta.advice_column_in(SecondPhase),
@@ -1144,6 +1187,7 @@ impl KeccakTable {
     }
 
     /// Generate the keccak table assignments from a byte array input.
+    /// Used only for dev_load
     pub fn assignments<F: Field>(
         input: &[u8],
         challenges: &Challenges<Value<F>>,
@@ -1171,6 +1215,8 @@ impl KeccakTable {
     }
 
     /// Assign a table row for keccak table
+    /// Used inside keccak circuit
+    /// q_enable assigned inside keccak circuit
     pub fn assign_row<F: Field>(
         &self,
         region: &mut Region<F>,
@@ -1199,6 +1245,12 @@ impl KeccakTable {
             |mut region| {
                 let mut offset = 0;
                 for column in <KeccakTable as LookupTable<F>>::advice_columns(self) {
+                    region.assign_fixed(
+                        || "keccak table all-zero row",
+                        self.q_enable,
+                        offset,
+                        || Value::known(F::one()),
+                    )?;
                     region.assign_advice(
                         || "keccak table all-zero row",
                         column,
@@ -1211,7 +1263,12 @@ impl KeccakTable {
                 let keccak_table_columns = <KeccakTable as LookupTable<F>>::advice_columns(self);
                 for input in inputs.clone() {
                     for row in Self::assignments(input, challenges) {
-                        // let mut column_index = 0;
+                        region.assign_fixed(
+                            || format!("keccak table row {}", offset),
+                            self.q_enable,
+                            offset,
+                            || Value::known(F::one()),
+                        )?;
                         for (&column, value) in keccak_table_columns.iter().zip_eq(row) {
                             region.assign_advice(
                                 || format!("keccak table row {}", offset),
@@ -1280,7 +1337,7 @@ pub struct CopyTable {
 }
 
 type CopyTableRow<F> = [(Value<F>, &'static str); 8];
-type CopyCircuitRow<F> = [(Value<F>, &'static str); 4];
+type CopyCircuitRow<F> = [(Value<F>, &'static str); 5];
 
 impl CopyTable {
     /// Construct a new CopyTable
@@ -1305,7 +1362,7 @@ impl CopyTable {
     ) -> Vec<(CopyDataType, CopyTableRow<F>, CopyCircuitRow<F>)> {
         let mut assignments = Vec::new();
         // rlc_acc
-        let rlc_acc = if copy_event.dst_type == CopyDataType::RlcAcc {
+        let rlc_acc = {
             let values = copy_event
                 .bytes
                 .iter()
@@ -1314,8 +1371,6 @@ impl CopyTable {
             challenges
                 .keccak_input()
                 .map(|keccak_input| rlc::value(values.iter().rev(), keccak_input))
-        } else {
-            Value::known(F::zero())
         };
         let mut value_acc = Value::known(F::zero());
         for (step_idx, (is_read_step, copy_step)) in copy_event
@@ -1390,17 +1445,11 @@ impl CopyTable {
             // bytes_left
             let bytes_left = u64::try_from(copy_event.bytes.len() * 2 - step_idx).unwrap() / 2;
             // value
-            let value = if copy_event.dst_type == CopyDataType::RlcAcc {
-                if is_read_step {
-                    Value::known(F::from(copy_step.value as u64))
-                } else {
-                    value_acc = value_acc * challenges.keccak_input()
-                        + Value::known(F::from(copy_step.value as u64));
-                    value_acc
-                }
-            } else {
-                Value::known(F::from(copy_step.value as u64))
-            };
+            let value = Value::known(F::from(copy_step.value as u64));
+            // value_acc
+            if is_read_step {
+                value_acc = value_acc * challenges.keccak_input() + value;
+            }
             // is_pad
             let is_pad = Value::known(F::from(
                 is_read_step && copy_step_addr >= copy_event.src_addr_end,
@@ -1420,7 +1469,14 @@ impl CopyTable {
                         "src_addr_end",
                     ),
                     (Value::known(F::from(bytes_left)), "bytes_left"),
-                    (rlc_acc, "rlc_acc"),
+                    (
+                        match (copy_event.src_type, copy_event.dst_type) {
+                            (CopyDataType::Memory, CopyDataType::Bytecode) => rlc_acc,
+                            (_, CopyDataType::RlcAcc) => rlc_acc,
+                            _ => Value::known(F::zero()),
+                        },
+                        "rlc_acc",
+                    ),
                     (
                         Value::known(F::from(copy_event.rw_counter(step_idx))),
                         "rw_counter",
@@ -1433,6 +1489,7 @@ impl CopyTable {
                 [
                     (is_last, "is_last"),
                     (value, "value"),
+                    (value_acc, "value_acc"),
                     (is_pad, "is_pad"),
                     (is_code, "is_code"),
                 ],

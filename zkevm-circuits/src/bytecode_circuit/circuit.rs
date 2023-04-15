@@ -4,8 +4,8 @@ use crate::{
     util::{get_push_size, Challenges, Expr, SubCircuit, SubCircuitConfig},
     witness,
 };
-use bus_mapping::state_db::EMPTY_CODE_HASH_LE;
-use eth_types::{Field, ToLittleEndian};
+use bus_mapping::{state_db::EMPTY_CODE_HASH_LE, util::POSEIDON_CODE_HASH_ZERO};
+use eth_types::{Field, ToLittleEndian, ToScalar, ToWord};
 use gadgets::is_zero::{IsZeroChip, IsZeroConfig, IsZeroInstruction};
 use halo2_proofs::{
     circuit::{Layouter, Region, Value},
@@ -19,8 +19,6 @@ use super::{
     param::PUSH_TABLE_WIDTH,
 };
 
-#[cfg(any(feature = "test", test, feature = "test-circuits"))]
-use halo2_proofs::{circuit::SimpleFloorPlanner, plonk::Circuit};
 /// An extended circuit for binding with poseidon
 pub mod to_poseidon_hash;
 
@@ -30,19 +28,14 @@ use halo2_proofs::plonk::FirstPhase as SecondPhase;
 use halo2_proofs::plonk::SecondPhase;
 
 #[cfg(feature = "poseidon-codehash")]
-use super::circuit::to_poseidon_hash::{
-    ToHashBlockBytecodeCircuitConfigArgs, ToHashBlockCircuitConfig, HASHBLOCK_BYTES_IN_FIELD,
-};
+use super::circuit::to_poseidon_hash::{ToHashBlockCircuitConfig, HASHBLOCK_BYTES_IN_FIELD};
 
-#[cfg(feature = "poseidon-codehash")]
-use crate::table::PoseidonTable;
 #[cfg(feature = "poseidon-codehash")]
 /// alias for circuit config
 pub type CircuitConfig<F> = ToHashBlockCircuitConfig<F, HASHBLOCK_BYTES_IN_FIELD>;
 #[cfg(not(feature = "poseidon-codehash"))]
 /// alias for circuit config
 pub type CircuitConfig<F> = BytecodeCircuitConfig<F>;
-
 #[derive(Clone, Debug)]
 /// Bytecode circuit configuration
 pub struct BytecodeCircuitConfig<F> {
@@ -57,6 +50,8 @@ pub struct BytecodeCircuitConfig<F> {
     push_data_size: Column<Advice>,
     push_data_left_inv: Column<Advice>,
     push_data_left_is_zero: IsZeroConfig<F>,
+    index_length_diff_inv: Column<Advice>,
+    index_length_diff_is_zero: IsZeroConfig<F>,
     push_table: [Column<Fixed>; PUSH_TABLE_WIDTH],
     // External tables
     pub(crate) keccak_table: KeccakTable,
@@ -84,7 +79,7 @@ impl<F: Field> SubCircuitConfig<F> for BytecodeCircuitConfig<F> {
             challenges,
         }: Self::ConfigArgs,
     ) -> Self {
-        let q_enable = meta.fixed_column();
+        let q_enable = bytecode_table.q_enable;
         let q_first = meta.fixed_column();
         let q_last = meta.fixed_column();
         let value = bytecode_table.value;
@@ -93,6 +88,7 @@ impl<F: Field> SubCircuitConfig<F> for BytecodeCircuitConfig<F> {
         let length = meta.advice_column();
         let push_data_size = meta.advice_column();
         let push_data_left_inv = meta.advice_column();
+        let index_length_diff_inv = meta.advice_column();
         let push_table = array_init::array_init(|_| meta.fixed_column());
 
         // annotate columns
@@ -145,6 +141,17 @@ impl<F: Field> SubCircuitConfig<F> for BytecodeCircuitConfig<F> {
             |meta| meta.query_advice(push_data_left, Rotation::cur()),
             push_data_left_inv,
         );
+
+        let index_length_diff_is_zero = IsZeroChip::configure(
+            meta,
+            |meta| meta.query_fixed(q_enable, Rotation::cur()),
+            |meta| {
+                meta.query_advice(bytecode_table.index, Rotation::cur()) + 1.expr()
+                    - meta.query_advice(length, Rotation::cur())
+            },
+            index_length_diff_inv,
+        );
+        // dbg!(index_length_diff_is_zero.clone().is_zero_expression);
 
         // When q_first || q_last ->
         // assert cur.tag == Header
@@ -241,10 +248,14 @@ impl<F: Field> SubCircuitConfig<F> for BytecodeCircuitConfig<F> {
                 meta.query_advice(length, Rotation::cur()),
             );
 
-            let empty_hash = rlc::expr(
-                &EMPTY_CODE_HASH_LE.map(|v| Expression::Constant(F::from(v as u64))),
-                challenges.evm_word(),
-            );
+            let empty_hash = if cfg!(feature = "poseidon-codehash") {
+                Expression::Constant(POSEIDON_CODE_HASH_ZERO.to_word().to_scalar().unwrap())
+            } else {
+                rlc::expr(
+                    &EMPTY_CODE_HASH_LE.map(|v| Expression::Constant(F::from(v as u64))),
+                    challenges.evm_word(),
+                )
+            };
 
             cb.require_equal(
                 "assert cur.hash == EMPTY_HASH",
@@ -360,6 +371,23 @@ impl<F: Field> SubCircuitConfig<F> for BytecodeCircuitConfig<F> {
             ]))
         });
 
+        // When cur.tag == Byte and cur.index + 1 == cur.length ->
+        // assert next.tag == Header
+        meta.create_gate("cur.tag == Byte and cur.index + 1 == cur.length", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.require_zero(
+                "next.tag == Header",
+                meta.query_advice(bytecode_table.tag, Rotation::next()),
+            );
+
+            cb.gate(and::expr(vec![
+                meta.query_fixed(q_enable, Rotation::cur()),
+                meta.query_advice(bytecode_table.tag, Rotation::cur()),
+                index_length_diff_is_zero.clone().is_zero_expression,
+            ]))
+        });
+
         // When is_byte_to_header ->
         // assert cur.index + 1 == cur.length
         // assert keccak256_table_lookup(cur.hash, cur.length, cur.value_rlc)
@@ -387,11 +415,12 @@ impl<F: Field> SubCircuitConfig<F> for BytecodeCircuitConfig<F> {
                     not::expr(meta.query_fixed(q_last, Rotation::cur())),
                     is_byte_to_header(meta),
                 ]);
+                let keccak_enable = and::expr(vec![
+                    meta.query_fixed(keccak_table.q_enable, Rotation::cur()),
+                    meta.query_advice(keccak_table.is_final, Rotation::cur()),
+                ]);
 
-                let mut constraints = vec![(
-                    enable.clone(),
-                    meta.query_advice(keccak_table.is_enabled, Rotation::cur()),
-                )];
+                let mut constraints = vec![(enable.clone(), keccak_enable)];
 
                 for (circuit_column, table_column) in
                     keccak_table.match_columns(value_rlc, length, bytecode_table.code_hash)
@@ -418,6 +447,8 @@ impl<F: Field> SubCircuitConfig<F> for BytecodeCircuitConfig<F> {
             push_data_size,
             push_data_left_inv,
             push_data_left_is_zero,
+            index_length_diff_inv,
+            index_length_diff_is_zero,
             push_table,
             keccak_table,
         }
@@ -430,9 +461,10 @@ impl<F: Field> BytecodeCircuitConfig<F> {
         layouter: &mut impl Layouter<F>,
         size: usize,
         witness: &[UnrolledBytecode<F>],
+        overwrite: &UnrolledBytecode<F>,
         challenges: &Challenges<Value<F>>,
     ) -> Result<(), Error> {
-        self.assign_internal(layouter, size, witness, challenges, true)
+        self.assign_internal(layouter, size, witness, overwrite, challenges, true)
     }
 
     pub(crate) fn assign_internal(
@@ -440,11 +472,14 @@ impl<F: Field> BytecodeCircuitConfig<F> {
         layouter: &mut impl Layouter<F>,
         size: usize,
         witness: &[UnrolledBytecode<F>],
+        overwrite: &UnrolledBytecode<F>,
         challenges: &Challenges<Value<F>>,
         fail_fast: bool,
     ) -> Result<(), Error> {
         let push_data_left_is_zero_chip =
             IsZeroChip::construct(self.push_data_left_is_zero.clone());
+        let index_length_diff_is_zero_chip =
+            IsZeroChip::construct(self.index_length_diff_is_zero.clone());
 
         // Subtract the unusable rows from the size
         assert!(size > self.minimum_rows);
@@ -457,9 +492,13 @@ impl<F: Field> BytecodeCircuitConfig<F> {
             last_row_offset
         );
 
-        let empty_hash = challenges
-            .evm_word()
-            .map(|challenge| rlc::value(EMPTY_CODE_HASH_LE.as_ref(), challenge));
+        let empty_hash = challenges.evm_word().map(|challenge| {
+            if cfg!(feature = "poseidon-codehash") {
+                POSEIDON_CODE_HASH_ZERO.to_word().to_scalar().unwrap()
+            } else {
+                rlc::value(EMPTY_CODE_HASH_LE.as_ref(), challenge)
+            }
+        });
 
         let mut is_first_time = true;
         layouter.assign_region(
@@ -470,6 +509,7 @@ impl<F: Field> BytecodeCircuitConfig<F> {
                     self.set_padding_row(
                         &mut region,
                         &push_data_left_is_zero_chip,
+                        &index_length_diff_is_zero_chip,
                         empty_hash,
                         last_row_offset,
                         last_row_offset,
@@ -486,6 +526,7 @@ impl<F: Field> BytecodeCircuitConfig<F> {
                         bytecode,
                         challenges,
                         &push_data_left_is_zero_chip,
+                        &index_length_diff_is_zero_chip,
                         empty_hash,
                         &mut offset,
                         last_row_offset,
@@ -498,14 +539,70 @@ impl<F: Field> BytecodeCircuitConfig<F> {
                     self.set_padding_row(
                         &mut region,
                         &push_data_left_is_zero_chip,
+                        &index_length_diff_is_zero_chip,
                         empty_hash,
                         idx,
                         last_row_offset,
                     )?;
                 }
+
+                self.assign_overwrite(&mut region, overwrite, challenges)?;
                 Ok(())
             },
         )
+    }
+
+    fn assign_overwrite(
+        &self,
+        region: &mut Region<'_, F>,
+        overwrite: &UnrolledBytecode<F>,
+        challenges: &Challenges<Value<F>>,
+    ) -> Result<(), Error> {
+        // Overwrite the witness assignment by using the values in the `overwrite`
+        // parameter.  This is used to explicitly set intermediate witness values for
+        // negative tests.
+        let mut value_rlc = challenges.keccak_input().map(|_| F::zero());
+        for (offset, row) in overwrite.rows.iter().enumerate() {
+            for (name, column, value) in [
+                ("tag", self.bytecode_table.tag, row.tag),
+                ("index", self.bytecode_table.index, row.index),
+                ("is_code", self.bytecode_table.is_code, row.is_code),
+                ("value", self.bytecode_table.value, row.value),
+                ("length", self.length, F::from(overwrite.bytes.len() as u64)),
+            ] {
+                region.assign_advice(
+                    || format!("assign {} {}", name, offset),
+                    column,
+                    offset,
+                    || Value::known(value),
+                )?;
+            }
+
+            if row.tag == F::one() {
+                value_rlc
+                    .as_mut()
+                    .zip(challenges.keccak_input())
+                    .map(|(value_rlc, challenge)| *value_rlc = *value_rlc * challenge + row.value);
+            } else {
+                value_rlc = challenges.keccak_input().map(|_| F::zero());
+            }
+
+            let code_hash = challenges
+                .evm_word()
+                .map(|challenge| rlc::value(&row.code_hash.to_le_bytes(), challenge));
+            for (name, column, value) in [
+                ("code_hash", self.bytecode_table.code_hash, code_hash),
+                ("value_rlc", self.value_rlc, value_rlc),
+            ] {
+                region.assign_advice(
+                    || format!("assign {} {}", name, offset),
+                    column,
+                    offset,
+                    || value,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -515,6 +612,7 @@ impl<F: Field> BytecodeCircuitConfig<F> {
         bytecode: &UnrolledBytecode<F>,
         challenges: &Challenges<Value<F>>,
         push_data_left_is_zero_chip: &IsZeroChip<F>,
+        index_length_diff_is_zero_chip: &IsZeroChip<F>,
         empty_hash: Value<F>,
         offset: &mut usize,
         last_row_offset: usize,
@@ -529,9 +627,13 @@ impl<F: Field> BytecodeCircuitConfig<F> {
 
         // Code hash with challenge is calculated only using the first row of the
         // bytecode (header row), the rest of the code_hash in other rows are ignored.
-        let code_hash = challenges
-            .evm_word()
-            .map(|challenge| rlc::value(&bytecode.rows[0].code_hash.to_le_bytes(), challenge));
+        let code_hash = challenges.evm_word().map(|challenge| {
+            if cfg!(feature = "poseidon-codehash") {
+                bytecode.rows[0].code_hash.to_scalar().unwrap()
+            } else {
+                rlc::value(&bytecode.rows[0].code_hash.to_le_bytes(), challenge)
+            }
+        });
 
         for (idx, row) in bytecode.rows.iter().enumerate() {
             if fail_fast && *offset > last_row_offset {
@@ -567,6 +669,7 @@ impl<F: Field> BytecodeCircuitConfig<F> {
                 self.set_row(
                     region,
                     push_data_left_is_zero_chip,
+                    index_length_diff_is_zero_chip,
                     *offset,
                     true,
                     *offset == last_row_offset,
@@ -604,6 +707,7 @@ impl<F: Field> BytecodeCircuitConfig<F> {
                 self.set_padding_row(
                     region,
                     push_data_left_is_zero_chip,
+                    index_length_diff_is_zero_chip,
                     empty_hash,
                     *offset,
                     last_row_offset,
@@ -618,6 +722,7 @@ impl<F: Field> BytecodeCircuitConfig<F> {
         &self,
         region: &mut Region<'_, F>,
         push_data_left_is_zero_chip: &IsZeroChip<F>,
+        index_length_diff_is_zero_chip: &IsZeroChip<F>,
         empty_hash: Value<F>,
         offset: usize,
         last_row_offset: usize,
@@ -625,8 +730,9 @@ impl<F: Field> BytecodeCircuitConfig<F> {
         self.set_row(
             region,
             push_data_left_is_zero_chip,
+            index_length_diff_is_zero_chip,
             offset,
-            offset < last_row_offset,
+            offset <= last_row_offset,
             offset == last_row_offset,
             empty_hash,
             F::from(BytecodeFieldTag::Header as u64),
@@ -645,6 +751,7 @@ impl<F: Field> BytecodeCircuitConfig<F> {
         &self,
         region: &mut Region<'_, F>,
         push_data_left_is_zero_chip: &IsZeroChip<F>,
+        index_length_diff_is_zero_chip: &IsZeroChip<F>,
         offset: usize,
         enable: bool,
         last: bool,
@@ -722,6 +829,12 @@ impl<F: Field> BytecodeCircuitConfig<F> {
             Value::known(F::from(push_data_left)),
         )?;
 
+        index_length_diff_is_zero_chip.assign(
+            region,
+            offset,
+            Value::known(index + F::one() - length),
+        )?;
+
         Ok(())
     }
 
@@ -731,6 +844,8 @@ impl<F: Field> BytecodeCircuitConfig<F> {
 
         self.push_data_left_is_zero
             .annotate_columns_in_region(region, "BYTECODE");
+        self.index_length_diff_is_zero
+            .annotate_columns_in_region(region, "BYTECODE");
         region.name_column(|| "BYTECODE_q_enable", self.q_enable);
         region.name_column(|| "BYTECODE_q_first", self.q_first);
         region.name_column(|| "BYTECODE_q_last", self.q_last);
@@ -739,6 +854,10 @@ impl<F: Field> BytecodeCircuitConfig<F> {
         region.name_column(|| "BYTECODE_push_data_size", self.push_data_size);
         region.name_column(|| "BYTECODE_value_rlc", self.value_rlc);
         region.name_column(|| "BYTECODE_push_data_left_inv", self.push_data_left_inv);
+        region.name_column(
+            || "BYTECODE_index_length_diff_inv",
+            self.index_length_diff_inv,
+        );
     }
 
     /// load fixed tables
@@ -779,12 +898,18 @@ pub struct BytecodeCircuit<F: Field> {
     pub bytecodes: Vec<UnrolledBytecode<F>>,
     /// Circuit size
     pub size: usize,
+    /// Overwrite
+    pub overwrite: UnrolledBytecode<F>,
 }
 
 impl<F: Field> BytecodeCircuit<F> {
     /// new BytecodeCircuitTester
     pub fn new(bytecodes: Vec<UnrolledBytecode<F>>, size: usize) -> Self {
-        BytecodeCircuit { bytecodes, size }
+        BytecodeCircuit {
+            bytecodes,
+            size,
+            overwrite: Default::default(),
+        }
     }
 
     /// Creates bytecode circuit from block and bytecode_size.
@@ -839,313 +964,13 @@ impl<F: Field> SubCircuit<F> for BytecodeCircuit<F> {
         layouter: &mut impl Layouter<F>,
     ) -> Result<(), Error> {
         config.load_aux_tables(layouter)?;
-        config.assign_internal(layouter, self.size, &self.bytecodes, challenges, true)
-    }
-}
-
-#[cfg(any(feature = "test", test, feature = "test-circuits"))]
-impl<F: Field> Circuit<F> for BytecodeCircuit<F> {
-    type Config = (CircuitConfig<F>, Challenges);
-    type FloorPlanner = SimpleFloorPlanner;
-
-    fn without_witnesses(&self) -> Self {
-        Self::default()
-    }
-
-    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        let bytecode_table = BytecodeTable::construct(meta);
-        let keccak_table = KeccakTable::construct(meta);
-        let challenges = Challenges::construct(meta);
-        #[cfg(feature = "poseidon-codehash")]
-        let poseidon_table = PoseidonTable::construct(meta);
-
-        let config = {
-            let challenges = challenges.exprs(meta);
-            let args = BytecodeCircuitConfigArgs {
-                bytecode_table,
-                keccak_table,
-                challenges,
-            };
-            #[cfg(feature = "poseidon-codehash")]
-            let args = ToHashBlockBytecodeCircuitConfigArgs {
-                base_args: args,
-                poseidon_table,
-            };
-
-            CircuitConfig::new(meta, args)
-        };
-
-        (config, challenges)
-    }
-
-    fn synthesize(
-        &self,
-        (config, challenges): Self::Config,
-        mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
-        let challenges = challenges.values(&layouter);
-
-        config.keccak_table.dev_load(
-            &mut layouter,
-            self.bytecodes.iter().map(|b| &b.bytes),
-            &challenges,
-        )?;
-        #[cfg(feature = "poseidon-codehash")]
-        config.poseidon_table.dev_load(
-            &mut layouter,
-            self.bytecodes.iter().map(|b| &b.bytes),
-            &challenges,
-        )?;
-        self.synthesize_sub(&config, &challenges, &mut layouter)?;
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        bytecode_circuit::{
-            bytecode_unroller::{unroll, BytecodeRow},
-            dev::test_bytecode_circuit_unrolled,
-        },
-        util::is_push,
-    };
-    use bus_mapping::{evm::OpcodeId, state_db::CodeDB};
-    use eth_types::{Bytecode, ToWord, Word};
-    use halo2_proofs::halo2curves::bn256::Fr;
-
-    /// Verify unrolling code
-    #[test]
-    fn bytecode_unrolling() {
-        let k = 10;
-        let mut rows = vec![];
-        let mut bytecode = Bytecode::default();
-        // First add all non-push bytes, which should all be seen as code
-        for byte in 0u8..=255u8 {
-            if !is_push(byte) {
-                bytecode.write(byte, true);
-                rows.push(BytecodeRow {
-                    code_hash: Word::zero(),
-                    tag: Fr::from(BytecodeFieldTag::Byte as u64),
-                    index: Fr::from(rows.len() as u64),
-                    is_code: Fr::from(true as u64),
-                    value: Fr::from(byte as u64),
-                });
-            }
-        }
-        // Now add the different push ops
-        for n in 1..=32 {
-            let data_byte = OpcodeId::PUSH32.as_u8();
-            bytecode.push(
-                n,
-                Word::from_little_endian(&vec![data_byte; n as usize][..]),
-            );
-            rows.push(BytecodeRow {
-                code_hash: Word::zero(),
-                tag: Fr::from(BytecodeFieldTag::Byte as u64),
-                index: Fr::from(rows.len() as u64),
-                is_code: Fr::from(true as u64),
-                value: Fr::from(OpcodeId::PUSH1.as_u64() + ((n - 1) as u64)),
-            });
-            for _ in 0..n {
-                rows.push(BytecodeRow {
-                    code_hash: Word::zero(),
-                    tag: Fr::from(BytecodeFieldTag::Byte as u64),
-                    index: Fr::from(rows.len() as u64),
-                    is_code: Fr::from(false as u64),
-                    value: Fr::from(data_byte as u64),
-                });
-            }
-        }
-        // Set the code_hash of the complete bytecode in the rows
-        let code_hash = CodeDB::hash(&bytecode.to_vec()[..]).to_word();
-        for row in rows.iter_mut() {
-            row.code_hash = code_hash;
-        }
-        rows.insert(
-            0,
-            BytecodeRow {
-                code_hash,
-                tag: Fr::from(BytecodeFieldTag::Header as u64),
-                index: Fr::zero(),
-                is_code: Fr::zero(),
-                value: Fr::from(bytecode.to_vec().len() as u64),
-            },
-        );
-        // Unroll the bytecode
-        let unrolled = unroll(bytecode.to_vec());
-        // Check if the bytecode was unrolled correctly
-        assert_eq!(
-            UnrolledBytecode {
-                bytes: bytecode.to_vec(),
-                rows,
-            },
-            unrolled,
-        );
-        // Verify the unrolling in the circuit
-        test_bytecode_circuit_unrolled::<Fr>(k, vec![unrolled], true);
-    }
-
-    /// Tests a fully empty circuit
-    #[test]
-    fn bytecode_empty() {
-        let k = 9;
-        test_bytecode_circuit_unrolled::<Fr>(k, vec![unroll(vec![])], true);
-    }
-
-    #[test]
-    fn bytecode_simple() {
-        let k = 9;
-        let bytecodes = vec![unroll(vec![7u8]), unroll(vec![6u8]), unroll(vec![5u8])];
-        test_bytecode_circuit_unrolled::<Fr>(k, bytecodes, true);
-    }
-
-    /// Tests a fully full circuit
-    #[test]
-    fn bytecode_full() {
-        let k = 9;
-        test_bytecode_circuit_unrolled::<Fr>(k, vec![unroll(vec![7u8; 2usize.pow(k) - 8])], true);
-    }
-
-    #[test]
-    fn bytecode_last_row_with_byte() {
-        let k = 9;
-        // Last row must be a padding row, so we have one row less for actual bytecode
-        test_bytecode_circuit_unrolled::<Fr>(k, vec![unroll(vec![7u8; 2usize.pow(k) - 7])], false);
-    }
-
-    /// Tests a circuit with incomplete bytecode
-    #[test]
-    fn bytecode_incomplete() {
-        let k = 9;
-        test_bytecode_circuit_unrolled::<Fr>(k, vec![unroll(vec![7u8; 2usize.pow(k) + 1])], false);
-    }
-
-    /// Tests multiple bytecodes in a single circuit
-    #[test]
-    fn bytecode_push() {
-        let k = 9;
-        test_bytecode_circuit_unrolled::<Fr>(
-            k,
-            vec![
-                unroll(vec![]),
-                unroll(vec![OpcodeId::PUSH32.as_u8()]),
-                unroll(vec![OpcodeId::PUSH32.as_u8(), OpcodeId::ADD.as_u8()]),
-                unroll(vec![OpcodeId::ADD.as_u8(), OpcodeId::PUSH32.as_u8()]),
-                unroll(vec![
-                    OpcodeId::ADD.as_u8(),
-                    OpcodeId::PUSH32.as_u8(),
-                    OpcodeId::ADD.as_u8(),
-                ]),
-            ],
+        config.assign_internal(
+            layouter,
+            self.size,
+            &self.bytecodes,
+            &self.overwrite,
+            challenges,
             true,
-        );
-    }
-
-    /// Test invalid code_hash data
-    #[test]
-    fn bytecode_invalid_hash_data() {
-        let k = 9;
-        let bytecode = vec![8u8, 2, 3, 8, 9, 7, 128];
-        let unrolled = unroll(bytecode);
-        test_bytecode_circuit_unrolled::<Fr>(k, vec![unrolled.clone()], true);
-        // Change the code_hash on the first position (header row)
-        {
-            let mut invalid = unrolled;
-            invalid.rows[0].code_hash += Word::one();
-            log::trace!("bytecode_invalid_hash_data: Change the code_hash on the first position");
-            test_bytecode_circuit_unrolled::<Fr>(k, vec![invalid], false);
-        }
-        // TODO: other rows code_hash are ignored by the witness generation, to
-        // test other rows invalid code_hash, we would need to inject an evil
-        // witness.
-    }
-
-    /// Test invalid index
-    #[test]
-    #[ignore]
-    fn bytecode_invalid_index() {
-        let k = 9;
-        let bytecode = vec![8u8, 2, 3, 8, 9, 7, 128];
-        let unrolled = unroll(bytecode);
-        test_bytecode_circuit_unrolled::<Fr>(k, vec![unrolled.clone()], true);
-        // Start the index at 1
-        {
-            let mut invalid = unrolled.clone();
-            for row in invalid.rows.iter_mut() {
-                row.index += Fr::one();
-            }
-            test_bytecode_circuit_unrolled::<Fr>(k, vec![invalid], false);
-        }
-        // Don't increment an index once
-        {
-            let mut invalid = unrolled;
-            invalid.rows.last_mut().unwrap().index -= Fr::one();
-            test_bytecode_circuit_unrolled::<Fr>(k, vec![invalid], false);
-        }
-    }
-
-    /// Test invalid byte data
-
-    #[test]
-    fn bytecode_invalid_byte_data() {
-        let k = 9;
-        let bytecode = vec![8u8, 2, 3, 8, 9, 7, 128];
-        let unrolled = unroll(bytecode);
-        test_bytecode_circuit_unrolled::<Fr>(k, vec![unrolled.clone()], true);
-        // Change the first byte
-        {
-            let mut invalid = unrolled.clone();
-            invalid.rows[1].value = Fr::from(9u64);
-            test_bytecode_circuit_unrolled::<Fr>(k, vec![invalid], false);
-        }
-        // Change a byte on another position
-        {
-            let mut invalid = unrolled.clone();
-            invalid.rows[5].value = Fr::from(6u64);
-            test_bytecode_circuit_unrolled::<Fr>(k, vec![invalid], false);
-        }
-        // Set a byte value out of range
-        {
-            let mut invalid = unrolled;
-            invalid.rows[3].value = Fr::from(256u64);
-            test_bytecode_circuit_unrolled::<Fr>(k, vec![invalid], false);
-        }
-    }
-
-    /// Test invalid is_code data
-    #[test]
-    fn bytecode_invalid_is_code() {
-        let k = 9;
-        let bytecode = vec![
-            OpcodeId::ADD.as_u8(),
-            OpcodeId::PUSH1.as_u8(),
-            OpcodeId::PUSH1.as_u8(),
-            OpcodeId::SUB.as_u8(),
-            OpcodeId::PUSH7.as_u8(),
-            OpcodeId::ADD.as_u8(),
-            OpcodeId::PUSH6.as_u8(),
-        ];
-        let unrolled = unroll(bytecode);
-        test_bytecode_circuit_unrolled::<Fr>(k, vec![unrolled.clone()], true);
-        // Mark the 3rd byte as code (is push data from the first PUSH1)
-        {
-            let mut invalid = unrolled.clone();
-            invalid.rows[3].is_code = Fr::one();
-            test_bytecode_circuit_unrolled::<Fr>(k, vec![invalid], false);
-        }
-        // Mark the 4rd byte as data (is code)
-        {
-            let mut invalid = unrolled.clone();
-            invalid.rows[4].is_code = Fr::zero();
-            test_bytecode_circuit_unrolled::<Fr>(k, vec![invalid], false);
-        }
-        // Mark the 7th byte as code (is data for the PUSH7)
-        {
-            let mut invalid = unrolled;
-            invalid.rows[7].is_code = Fr::one();
-            test_bytecode_circuit_unrolled::<Fr>(k, vec![invalid], false);
-        }
+        )
     }
 }

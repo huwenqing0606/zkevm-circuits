@@ -90,8 +90,6 @@ pub enum ExecutionState {
     ErrorStack,
     ErrorWriteProtection,
     ErrorDepth,
-    ErrorInsufficientBalance,
-    ErrorNonceUintOverflow,
     ErrorContractAddressCollision,
     ErrorInvalidCreationCode,
     ErrorInvalidJump,
@@ -111,7 +109,6 @@ pub enum ExecutionState {
     ErrorOutOfGasSloadSstore,
     ErrorOutOfGasCREATE2,
     ErrorOutOfGasSELFDESTRUCT,
-    ErrorGasUintOverflow,
 }
 
 impl Default for ExecutionState {
@@ -141,13 +138,9 @@ impl ExecutionState {
             Self::ErrorInvalidOpcode
                 | Self::ErrorStack
                 | Self::ErrorWriteProtection
-                | Self::ErrorDepth
-                | Self::ErrorInsufficientBalance
-                | Self::ErrorContractAddressCollision
                 | Self::ErrorInvalidCreationCode
                 | Self::ErrorInvalidJump
                 | Self::ErrorReturnDataOutOfBound
-                | Self::ErrorGasUintOverflow
                 | Self::ErrorOutOfGasConstant
                 | Self::ErrorOutOfGasStaticMemoryExpansion
                 | Self::ErrorOutOfGasDynamicMemoryExpansion
@@ -592,7 +585,7 @@ impl<F: FieldExt> Step<F> {
             .assign(region, offset, Value::known(F::from(step.block_num)))?;
         self.state
             .code_hash
-            .assign(region, offset, region.word_rlc(call.code_hash))?;
+            .assign(region, offset, region.code_hash(call.code_hash))?;
         self.state.program_counter.assign(
             region,
             offset,

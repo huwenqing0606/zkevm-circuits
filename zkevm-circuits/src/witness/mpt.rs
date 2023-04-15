@@ -115,6 +115,10 @@ impl MptUpdates {
         }
     }
 
+    pub(crate) fn mock_from(rows: &[Rw]) -> Self {
+        Self::from_rws_with_mock_state_roots(rows, 0xcafeu64.into(), 0xdeadbeefu64.into())
+    }
+
     pub(crate) fn from_rws_with_mock_state_roots(
         rows: &[Rw],
         old_root: U256,
@@ -188,7 +192,18 @@ impl MptUpdate {
     pub(crate) fn value_assignments<F: Field>(&self, word_randomness: F) -> (F, F) {
         let assign = |x: Word| match self.key {
             Key::Account {
-                field_tag: AccountFieldTag::Nonce | AccountFieldTag::NonExisting,
+                field_tag: AccountFieldTag::CodeHash,
+                ..
+            } => {
+                if cfg!(feature = "poseidon-codehash") {
+                    x.to_scalar().unwrap()
+                } else {
+                    rlc::value(&x.to_le_bytes(), word_randomness)
+                }
+            }
+            Key::Account {
+                field_tag:
+                    AccountFieldTag::Nonce | AccountFieldTag::NonExisting | AccountFieldTag::CodeSize,
                 ..
             } => x.to_scalar().unwrap(),
             _ => rlc::value(&x.to_le_bytes(), word_randomness),

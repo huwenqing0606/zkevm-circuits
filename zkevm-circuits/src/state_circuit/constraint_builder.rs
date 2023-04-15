@@ -1,14 +1,10 @@
 use super::{
     lookups::Queries as LookupsQueries, multiple_precision_integer::Queries as MpiQueries,
-    random_linear_combination::Queries as RlcQueries, N_LIMBS_ACCOUNT_ADDRESS, N_LIMBS_ID,
-    N_LIMBS_RW_COUNTER,
+    param::*, random_linear_combination::Queries as RlcQueries,
 };
 use crate::{
-    evm_circuit::{
-        param::N_BYTES_WORD,
-        util::{math_gadget::generate_lagrange_base_polynomial, not},
-    },
-    table::{AccountFieldTag, MPTProofType, RwTableTag},
+    evm_circuit::{param::N_BYTES_WORD, util::not},
+    table::{MPTProofType as ProofType, RwTableTag},
     util::Expr,
 };
 use eth_types::Field;
@@ -301,8 +297,8 @@ impl<F: Field> ConstraintBuilder<F> {
         self.require_equal(
             "mpt_proof_type is field_tag or NonExistingStorageProof",
             q.mpt_proof_type(),
-            is_non_exist.expr() * MPTProofType::NonExistingStorageProof.expr()
-                + (1.expr() - is_non_exist) * MPTProofType::StorageMod.expr(),
+            is_non_exist.expr() * ProofType::NonExistingStorageProof.expr()
+                + (1.expr() - is_non_exist) * ProofType::StorageMod.expr(),
         );
 
         // ref. spec 4.1. MPT lookup for last access to (address, storage_key)
@@ -413,11 +409,6 @@ impl<F: Field> ConstraintBuilder<F> {
         });
         // 7.2. `initial value` is 0
         self.require_zero("initial TxRefund value is 0", q.initial_value());
-        // 7.3. First access for a set of all keys are 0 if READ
-        self.require_zero(
-            "first access for a set of all keys are 0 if READ",
-            q.first_access() * q.is_read() * q.value(),
-        );
     }
 
     fn build_account_constraints(&mut self, q: &Queries<F>) {
@@ -427,35 +418,19 @@ impl<F: Field> ConstraintBuilder<F> {
             "storage_key is 0 for Account",
             q.rw_table.storage_key.clone(),
         );
-        self.require_in_set(
-            "field_tag in AccountFieldTag range",
-            q.field_tag(),
-            set::<F, AccountFieldTag>(),
-        );
 
-        // We use code_hash = 0 as non-existing account state.  code_hash: 0->0
-        // transition requires a non-existing proof.
-        // is_non_exist degree = 4
-        //   q.is_non_exist() degree = 1
-        //   generate_lagrange_base_polynomial() degree = 3
-        let is_non_exist = q.is_non_exist()
-            * generate_lagrange_base_polynomial(
-                q.field_tag(),
-                AccountFieldTag::CodeHash as usize,
-                [
-                    AccountFieldTag::Nonce,
-                    AccountFieldTag::Balance,
-                    AccountFieldTag::CodeHash,
-                ]
-                .iter()
-                .map(|t| *t as usize),
-            );
+        // mpt circuit will verify correctness of mpt proof type and therefore the field
+        // tag. self.require_in_set(
+        //     "field_tag in AccountFieldTag range",
+        //     q.field_tag(),
+        //     set::<F, AccountFieldTag>(),
+        // );
+
         self.require_equal(
             "mpt_proof_type is field_tag or NonExistingAccountProofs",
             q.mpt_proof_type(),
-            // degree = max(4, 4 + 1) = 5
-            is_non_exist.expr() * MPTProofType::NonExistingAccountProof.expr()
-                + (1.expr() - is_non_exist) * q.field_tag(),
+            q.is_non_exist() * ProofType::NonExistingAccountProof.expr()
+                + (1.expr() - q.is_non_exist()) * q.field_tag(),
         );
 
         // last_access degree = 1

@@ -5,6 +5,7 @@ use crate::{
     error::ExecError,
     evm::{Opcode, OpcodeId},
     operation::{AccountField, AccountOp, CallContextField, MemoryOp, RW},
+    state_db::CodeDB,
     Error,
 };
 use eth_types::{Bytecode, GethExecStep, ToBigEndian, ToWord, Word, H160, H256};
@@ -66,11 +67,11 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
             },
         )?;
 
-        let mut initialization_code = vec![];
-        if length > 0 {
-            initialization_code =
-                handle_copy(state, &mut exec_step, state.call()?.call_id, offset, length)?;
-        }
+        let (initialization_code, keccak_code_hash, code_hash) = if length > 0 {
+            handle_copy(state, &mut exec_step, state.call()?.call_id, offset, length)?
+        } else {
+            (vec![], H256(keccak256([])), CodeDB::empty_code_hash())
+        };
 
         let tx_id = state.tx_ctx.id();
         let caller = state.call()?.clone();
@@ -84,6 +85,14 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
         state.reversion_info_read(&mut exec_step, &caller);
         state.tx_access_list_write(&mut exec_step, address)?;
 
+        let depth = caller.depth;
+        state.call_context_read(
+            &mut exec_step,
+            caller.call_id,
+            CallContextField::Depth,
+            depth.to_word(),
+        );
+
         state.call_context_read(
             &mut exec_step,
             caller.call_id,
@@ -91,17 +100,39 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
             caller.address.to_word(),
         );
 
-        // Increase caller's nonce
-        let caller_nonce = state.sdb.get_nonce(&caller.address);
-        state.push_op_reversible(
+        let caller_balance = state.sdb.get_balance(&callee.caller_address);
+        state.account_read(
             &mut exec_step,
-            AccountOp {
-                address: caller.address,
-                field: AccountField::Nonce,
-                value: (caller_nonce + 1).into(),
-                value_prev: caller_nonce.into(),
-            },
-        )?;
+            callee.caller_address,
+            AccountField::Balance,
+            caller_balance,
+        );
+
+        let caller_nonce = state.sdb.get_nonce(&caller.address);
+        state.account_read(
+            &mut exec_step,
+            callee.caller_address,
+            AccountField::Nonce,
+            caller_nonce.into(),
+        );
+
+        // Check if an error of ErrDepth, ErrInsufficientBalance or
+        // ErrNonceUintOverflow occurred.
+        let is_precheck_ok =
+            depth < 1025 && caller_balance >= callee.value && caller_nonce < u64::MAX;
+
+        if is_precheck_ok {
+            // Increase caller's nonce
+            state.push_op_reversible(
+                &mut exec_step,
+                AccountOp {
+                    address: caller.address,
+                    field: AccountField::Nonce,
+                    value: (caller_nonce + 1).into(),
+                    value_prev: caller_nonce.into(),
+                },
+            )?;
+        }
 
         // TODO: look into when this can be pushed. Could it be done in parse call?
         state.push_call(callee.clone());
@@ -125,9 +156,11 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
         // operation happens in evm create() method before checking
         // ErrContractAddressCollision
         let code_hash_previous = if callee_exists {
-            // only create2 possibly cause address collision error.
-            assert_eq!(geth_step.op, OpcodeId::CREATE2);
-            exec_step.error = Some(ExecError::ContractAddressCollision);
+            if is_precheck_ok {
+                // only create2 possibly cause address collision error.
+                assert_eq!(geth_step.op, OpcodeId::CREATE2);
+                exec_step.error = Some(ExecError::ContractAddressCollision);
+            }
             callee_account.code_hash
         } else {
             H256::zero()
@@ -141,7 +174,7 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
             code_hash_previous.to_word(),
         );
 
-        if !callee_exists {
+        if is_precheck_ok && !callee_exists {
             state.transfer(
                 &mut exec_step,
                 callee.caller_address,
@@ -184,14 +217,18 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
             state.call_context_write(&mut exec_step, caller.call_id, field, value);
         }
 
-        state.call_context_read(
-            &mut exec_step,
-            caller.call_id,
-            CallContextField::Depth,
-            caller.depth.to_word(),
-        );
+        if !is_precheck_ok {
+            for (field, value) in [
+                (CallContextField::LastCalleeId, 0.into()),
+                (CallContextField::LastCalleeReturnDataOffset, 0.into()),
+                (CallContextField::LastCalleeReturnDataLength, 0.into()),
+            ] {
+                state.call_context_write(&mut exec_step, caller.call_id, field, value);
+            }
+            state.handle_return(&mut exec_step, geth_steps, false)?;
+            return Ok(vec![exec_step]);
+        }
 
-        let code_hash = keccak256(&initialization_code);
         for (field, value) in [
             (CallContextField::CallerId, caller.call_id.into()),
             (CallContextField::IsSuccess, callee.is_success.to_word()),
@@ -213,7 +250,7 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
             (CallContextField::IsRoot, false.to_word()),
             (CallContextField::IsStatic, false.to_word()),
             (CallContextField::IsCreate, true.to_word()),
-            (CallContextField::CodeHash, Word::from(code_hash)),
+            (CallContextField::CodeHash, code_hash.to_word()),
             (CallContextField::Value, callee.value),
         ] {
             state.call_context_write(&mut exec_step, callee.call_id, field, value);
@@ -226,13 +263,13 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
                 get_create2_address(
                     caller.address,
                     salt.to_be_bytes().to_vec(),
-                    initialization_code.clone()
+                    initialization_code.clone(),
                 )
             );
             std::iter::once(0xffu8)
                 .chain(caller.address.to_fixed_bytes())
                 .chain(salt.to_be_bytes())
-                .chain(keccak256(&initialization_code))
+                .chain(keccak_code_hash.to_fixed_bytes())
                 .collect::<Vec<_>>()
         } else {
             let mut stream = rlp::RlpStream::new();
@@ -248,6 +285,7 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
         );
 
         state.block.sha3_inputs.push(keccak_input);
+        state.block.sha3_inputs.push(initialization_code);
 
         if length == 0 || callee_exists {
             for (field, value) in [
@@ -257,7 +295,7 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
             ] {
                 state.call_context_write(&mut exec_step, caller.call_id, field, value);
             }
-            state.handle_return(geth_step)?;
+            state.handle_return(&mut exec_step, geth_steps, false)?;
         }
 
         Ok(vec![exec_step])
@@ -270,9 +308,10 @@ fn handle_copy(
     callee_id: usize,
     offset: usize,
     length: usize,
-) -> Result<Vec<u8>, Error> {
+) -> Result<(Vec<u8>, H256, H256), Error> {
     let initialization_bytes = state.call_ctx()?.memory.0[offset..offset + length].to_vec();
-    let dst_id = NumberOrHash::Hash(H256(keccak256(&initialization_bytes)));
+    let keccak_code_hash = H256(keccak256(&initialization_bytes));
+    let code_hash = CodeDB::hash(&initialization_bytes);
     let bytes: Vec<_> = Bytecode::from(initialization_bytes.clone())
         .code
         .iter()
@@ -298,14 +337,14 @@ fn handle_copy(
             src_addr: offset.try_into().unwrap(),
             src_addr_end: (offset + length).try_into().unwrap(),
             dst_type: CopyDataType::Bytecode,
-            dst_id,
+            dst_id: NumberOrHash::Hash(code_hash),
             dst_addr: 0,
             log_id: None,
             bytes,
         },
     );
 
-    Ok(initialization_bytes)
+    Ok((initialization_bytes, keccak_code_hash, code_hash))
 }
 
 #[cfg(test)]

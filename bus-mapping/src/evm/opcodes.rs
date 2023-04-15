@@ -1,7 +1,7 @@
 //! Definition of each opcode of the EVM.
 use crate::{
     circuit_input_builder::{CircuitInputStateRef, ExecStep},
-    error::{ExecError, OogError},
+    error::{ExecError, InsufficientBalanceError, NonceUintOverflowError, OogError},
     evm::OpcodeId,
     operation::{
         AccountField, AccountOp, CallContextField, TxAccessListAccountOp, TxReceiptField,
@@ -317,23 +317,28 @@ fn fn_gen_error_state_associated_ops(
         ExecError::CodeStoreOutOfGas => Some(ErrorCodeStore::gen_associated_ops),
         ExecError::MaxCodeSizeExceeded => Some(ErrorCodeStore::gen_associated_ops),
         // call & callcode can encounter InsufficientBalance error, Use pop-7 generic CallOpcode
-        ExecError::InsufficientBalance => {
-            if geth_step.op.is_create() {
-                unimplemented!("insufficient balance for create");
-            }
+        ExecError::InsufficientBalance(InsufficientBalanceError::Call) => {
             Some(CallOpcode::<7>::gen_associated_ops)
+        }
+        // create & create2 can encounter insufficient balance.
+        ExecError::InsufficientBalance(InsufficientBalanceError::Create) => {
+            Some(Create::<false>::gen_associated_ops)
+        }
+        ExecError::InsufficientBalance(InsufficientBalanceError::Create2) => {
+            Some(Create::<true>::gen_associated_ops)
         }
         ExecError::PrecompileFailed => Some(PrecompileFailed::gen_associated_ops),
         ExecError::WriteProtection => Some(ErrorWriteProtection::gen_associated_ops),
         ExecError::ReturnDataOutOfBounds => Some(ErrorReturnDataOutOfBound::gen_associated_ops),
         // only create2 may cause ContractAddressCollision error, so use Create::<true>.
         ExecError::ContractAddressCollision => Some(Create::<true>::gen_associated_ops),
-        ExecError::NonceUintOverflow => match geth_step.op {
-            OpcodeId::CREATE => Some(StackOnlyOpcode::<3, 1>::gen_associated_ops),
-            OpcodeId::CREATE2 => Some(StackOnlyOpcode::<4, 1>::gen_associated_ops),
-            _ => unreachable!(),
-        },
-        ExecError::GasUintOverflow => Some(StackOnlyOpcode::<0, 0, true>::gen_associated_ops),
+        // create & create2 can encounter nonce uint overflow.
+        ExecError::NonceUintOverflow(NonceUintOverflowError::Create) => {
+            Some(Create::<false>::gen_associated_ops)
+        }
+        ExecError::NonceUintOverflow(NonceUintOverflowError::Create2) => {
+            Some(Create::<true>::gen_associated_ops)
+        }
         ExecError::InvalidCreationCode => Some(ErrorCreationCode::gen_associated_ops),
         // more future errors place here
         _ => {
@@ -417,6 +422,10 @@ pub fn gen_associated_ops(
             steps[0].error = Some(exec_error.clone());
             return Ok(steps);
         } else {
+            // For exceptions that fail to enter next call context, we need
+            // to restore call context of current caller
+            let mut need_restore = true;
+
             // For exceptions that already enter next call context, but fail immediately
             // (e.g. Depth, InsufficientBalance), we still need to parse the call.
             if geth_step.op.is_call_or_create()
@@ -424,12 +433,10 @@ pub fn gen_associated_ops(
             {
                 let call = state.parse_call(geth_step)?;
                 state.push_call(call);
-            // For exceptions that fail to enter next call context, we need
-            // to restore call context of current caller
-            } else {
-                state.gen_restore_context_ops(&mut exec_step, geth_steps)?;
+                need_restore = false;
             }
-            state.handle_return(geth_step)?;
+
+            state.handle_return(&mut exec_step, geth_steps, need_restore)?;
             return Ok(vec![exec_step]);
         }
     }
@@ -890,6 +897,6 @@ fn dummy_gen_selfdestruct_ops(
         state.sdb.destruct_account(sender);
     }
 
-    state.handle_return(geth_step)?;
+    state.handle_return(&mut exec_step, geth_steps, false)?;
     Ok(vec![exec_step])
 }

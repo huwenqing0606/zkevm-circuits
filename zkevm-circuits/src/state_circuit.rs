@@ -3,10 +3,20 @@ mod constraint_builder;
 mod lexicographic_ordering;
 mod lookups;
 mod multiple_precision_integer;
+mod param;
 mod random_linear_combination;
-#[cfg(test)]
-mod test;
 
+#[cfg(any(feature = "test", test, feature = "test-circuits"))]
+mod dev;
+#[cfg(any(feature = "test", test))]
+mod test;
+#[cfg(any(feature = "test", test, feature = "test-circuits"))]
+pub use dev::StateCircuit as TestStateCircuit;
+
+use self::{
+    constraint_builder::{MptUpdateTableQueries, RwTableQueries},
+    lexicographic_ordering::LimbIndex,
+};
 use crate::{
     evm_circuit::{param::N_BYTES_WORD, util::rlc},
     table::{AccountFieldTag, LookupTable, MPTProofType, MptTable, RwTable, RwTableTag},
@@ -27,9 +37,8 @@ use halo2_proofs::{
 use lexicographic_ordering::Config as LexicographicOrderingConfig;
 use lookups::{Chip as LookupsChip, Config as LookupsConfig, Queries as LookupsQueries};
 use multiple_precision_integer::{Chip as MpiChip, Config as MpiConfig, Queries as MpiQueries};
+use param::*;
 use random_linear_combination::{Chip as RlcChip, Config as RlcConfig, Queries as RlcQueries};
-#[cfg(test)]
-use std::collections::HashMap;
 use std::marker::PhantomData;
 
 #[cfg(feature = "onephase")]
@@ -37,17 +46,8 @@ use halo2_proofs::plonk::FirstPhase as SecondPhase;
 #[cfg(not(feature = "onephase"))]
 use halo2_proofs::plonk::SecondPhase;
 
-use self::{
-    constraint_builder::{MptUpdateTableQueries, RwTableQueries},
-    lexicographic_ordering::LimbIndex,
-};
-
 #[cfg(any(feature = "test", test, feature = "test-circuits"))]
-use halo2_proofs::{circuit::SimpleFloorPlanner, plonk::Circuit};
-
-const N_LIMBS_RW_COUNTER: usize = 2;
-const N_LIMBS_ACCOUNT_ADDRESS: usize = 10;
-const N_LIMBS_ID: usize = 2;
+use std::collections::HashMap;
 
 /// Config for StateCircuit
 #[derive(Clone)]
@@ -132,6 +132,7 @@ impl<F: Field> SubCircuitConfig<F> for StateCircuitConfig<F> {
             |meta| meta.query_fixed(selector, Rotation::cur()),
             |meta| {
                 [
+                    meta.query_advice(rw_table.field_tag, Rotation::cur()),
                     meta.query_advice(initial_value, Rotation::cur()),
                     meta.query_advice(rw_table.value, Rotation::cur()),
                 ]
@@ -324,31 +325,35 @@ impl<F: Field> StateCircuitConfig<F> {
             )?;
 
             // Identify non-existing if both committed value and new value are zero.
-            let committed_value_value = randomness.map(|randomness| {
+            let is_non_exist_inputs = randomness.map(|randomness| {
                 let (_, committed_value) = updates
                     .get(row)
                     .map(|u| u.value_assignments(randomness))
                     .unwrap_or_default();
                 let value = row.value_assignment(randomness);
-                [committed_value, value]
+                [
+                    F::from(row.field_tag().unwrap_or_default()),
+                    committed_value,
+                    value,
+                ]
             });
             BatchedIsZeroChip::construct(self.is_non_exist.clone()).assign(
                 region,
                 offset,
-                committed_value_value,
+                is_non_exist_inputs,
             )?;
-            let mpt_proof_type = committed_value_value.map(|pair| {
+            let mpt_proof_type = is_non_exist_inputs.map(|[_field_tag, committed_value, value]| {
                 F::from(match row {
                     Rw::AccountStorage { .. } => {
-                        if pair[0].is_zero_vartime() && pair[1].is_zero_vartime() {
+                        if committed_value.is_zero_vartime() && value.is_zero_vartime() {
                             MPTProofType::NonExistingStorageProof as u64
                         } else {
                             MPTProofType::StorageMod as u64
                         }
                     }
                     Rw::Account { field_tag, .. } => {
-                        if pair[0].is_zero_vartime()
-                            && pair[1].is_zero_vartime()
+                        if committed_value.is_zero_vartime()
+                            && value.is_zero_vartime()
                             && matches!(field_tag, AccountFieldTag::CodeHash)
                         {
                             MPTProofType::NonExistingAccountProof as u64
@@ -460,8 +465,8 @@ pub struct StateCircuit<F> {
     pub(crate) updates: MptUpdates,
     pub(crate) n_rows: usize,
     pub(crate) exports: std::cell::RefCell<Option<StateCircuitExports<Assigned<F>>>>,
-    #[cfg(test)]
-    overrides: HashMap<(test::AdviceColumn, isize), F>,
+    #[cfg(any(feature = "test", test, feature = "test-circuits"))]
+    overrides: HashMap<(dev::AdviceColumn, isize), F>,
     _marker: PhantomData<F>,
 }
 
@@ -480,7 +485,7 @@ impl<F: Field> StateCircuit<F> {
             updates,
             exports: std::cell::RefCell::new(None),
             n_rows,
-            #[cfg(test)]
+            #[cfg(any(feature = "test", test, feature = "test-circuits"))]
             overrides: HashMap::new(),
             _marker: PhantomData::default(),
         }
@@ -498,7 +503,7 @@ impl<F: Field> SubCircuit<F> for StateCircuit<F> {
             updates,
             exports: std::cell::RefCell::new(None),
             n_rows: block.circuits_params.max_rws,
-            #[cfg(test)]
+            #[cfg(any(feature = "test", test, feature = "test-circuits"))]
             overrides: HashMap::new(),
             _marker: PhantomData::default(),
         }
@@ -559,7 +564,7 @@ impl<F: Field> SubCircuit<F> for StateCircuit<F> {
                     self.exports.borrow_mut().replace(exports);
                 }
 
-                #[cfg(test)]
+                #[cfg(any(feature = "test", test, feature = "test-circuits"))]
                 {
                     let padding_length = RwMap::padding_len(self.rows.len(), self.n_rows);
                     for ((column, row_offset), &f) in &self.overrides {
@@ -584,51 +589,6 @@ impl<F: Field> SubCircuit<F> for StateCircuit<F> {
     /// powers of randomness for instance columns
     fn instance(&self) -> Vec<Vec<F>> {
         vec![]
-    }
-}
-
-#[cfg(any(feature = "test", test, feature = "test-circuits"))]
-impl<F: Field> Circuit<F> for StateCircuit<F>
-where
-    F: Field,
-{
-    type Config = (StateCircuitConfig<F>, Challenges);
-    type FloorPlanner = SimpleFloorPlanner;
-
-    fn without_witnesses(&self) -> Self {
-        Self::default()
-    }
-
-    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        let rw_table = RwTable::construct(meta);
-        let mpt_table = MptTable::construct(meta);
-        let challenges = Challenges::construct(meta);
-
-        let config = {
-            let challenges = challenges.exprs(meta);
-            StateCircuitConfig::new(
-                meta,
-                StateCircuitConfigArgs {
-                    rw_table,
-                    mpt_table,
-                    challenges,
-                },
-            )
-        };
-
-        (config, challenges)
-    }
-
-    fn synthesize(
-        &self,
-        (config, challenges): Self::Config,
-        mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
-        let challenges = challenges.values(&layouter);
-        config
-            .mpt_table
-            .load(&mut layouter, &self.updates, challenges.evm_word())?;
-        self.synthesize_sub(&config, &challenges, &mut layouter)
     }
 }
 

@@ -304,6 +304,7 @@ pub(crate) struct ExecutionConfig<F> {
     returndatacopy_gadget: Box<ReturnDataCopyGadget<F>>,
     create_gadget: Box<CreateGadget<F, false, { ExecutionState::CREATE }>>,
     create2_gadget: Box<CreateGadget<F, true, { ExecutionState::CREATE2 }>>,
+    #[cfg(not(feature = "scroll"))]
     selfdestruct_gadget: Box<DummyGadget<F, 1, 0, { ExecutionState::SELFDESTRUCT }>>,
     signed_comparator_gadget: Box<SignedComparatorGadget<F>>,
     signextend_gadget: Box<SignextendGadget<F>>,
@@ -332,17 +333,12 @@ pub(crate) struct ExecutionConfig<F> {
     error_code_store: Box<ErrorCodeStoreGadget<F>>,
     error_oog_self_destruct:
         Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasSELFDESTRUCT }>>,
-    error_insufficient_balance:
-        Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorInsufficientBalance }>>,
-    error_nonce_uint_overflow:
-        Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorNonceUintOverflow }>>,
     error_invalid_jump: Box<ErrorInvalidJumpGadget<F>>,
     error_invalid_opcode: Box<ErrorInvalidOpcodeGadget<F>>,
     error_depth: Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorDepth }>>,
     error_invalid_creation_code: Box<ErrorInvalidCreationCodeGadget<F>>,
     error_precompile_failed: Box<ErrorPrecompileFailedGadget<F>>,
     error_return_data_out_of_bound: Box<ErrorReturnDataOutOfBoundGadget<F>>,
-    error_gas_uint_overflow: Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorGasUintOverflow }>>,
 }
 
 impl<F: Field> ExecutionConfig<F> {
@@ -571,6 +567,7 @@ impl<F: Field> ExecutionConfig<F> {
             returndatacopy_gadget: configure_gadget!(),
             create_gadget: configure_gadget!(),
             create2_gadget: configure_gadget!(),
+            #[cfg(not(feature = "scroll"))]
             selfdestruct_gadget: configure_gadget!(),
             shl_shr_gadget: configure_gadget!(),
             signed_comparator_gadget: configure_gadget!(),
@@ -597,16 +594,13 @@ impl<F: Field> ExecutionConfig<F> {
             error_oog_create2: configure_gadget!(),
             error_oog_self_destruct: configure_gadget!(),
             error_code_store: configure_gadget!(),
-            error_insufficient_balance: configure_gadget!(),
             error_invalid_jump: configure_gadget!(),
             error_invalid_opcode: configure_gadget!(),
             error_write_protection: configure_gadget!(),
             error_depth: configure_gadget!(),
-            error_nonce_uint_overflow: configure_gadget!(),
             error_invalid_creation_code: configure_gadget!(),
             error_return_data_out_of_bound: configure_gadget!(),
             error_precompile_failed: configure_gadget!(),
-            error_gas_uint_overflow: configure_gadget!(),
             // step and presets
             step: step_curr,
             height_map,
@@ -1371,7 +1365,10 @@ impl<F: Field> ExecutionConfig<F> {
             ExecutionState::CREATE2 => assign_exec_step!(self.create2_gadget),
             // dummy gadgets
             ExecutionState::EXTCODECOPY => assign_exec_step!(self.extcodecopy_gadget),
-            ExecutionState::SELFDESTRUCT => assign_exec_step!(self.selfdestruct_gadget),
+            ExecutionState::SELFDESTRUCT => {
+                #[cfg(not(feature = "scroll"))]
+                assign_exec_step!(self.selfdestruct_gadget)
+            }
             // end of dummy gadgets
             ExecutionState::SHA3 => assign_exec_step!(self.sha3_gadget),
             ExecutionState::SHL_SHR => assign_exec_step!(self.shl_shr_gadget),
@@ -1424,10 +1421,6 @@ impl<F: Field> ExecutionConfig<F> {
             ExecutionState::ErrorStack => {
                 assign_exec_step!(self.error_stack)
             }
-
-            ExecutionState::ErrorInsufficientBalance => {
-                assign_exec_step!(self.error_insufficient_balance)
-            }
             ExecutionState::ErrorInvalidJump => {
                 assign_exec_step!(self.error_invalid_jump)
             }
@@ -1440,9 +1433,6 @@ impl<F: Field> ExecutionConfig<F> {
             ExecutionState::ErrorDepth => {
                 assign_exec_step!(self.error_depth)
             }
-            ExecutionState::ErrorNonceUintOverflow => {
-                assign_exec_step!(self.error_nonce_uint_overflow)
-            }
             ExecutionState::ErrorContractAddressCollision => {
                 assign_exec_step!(self.create_gadget)
             }
@@ -1454,9 +1444,6 @@ impl<F: Field> ExecutionConfig<F> {
             }
             ExecutionState::ErrorPrecompileFailed => {
                 assign_exec_step!(self.error_precompile_failed)
-            }
-            ExecutionState::ErrorGasUintOverflow => {
-                assign_exec_step!(self.error_gas_uint_overflow)
             }
         }
 

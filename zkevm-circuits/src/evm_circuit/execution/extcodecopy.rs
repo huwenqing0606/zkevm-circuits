@@ -8,7 +8,10 @@ use crate::{
                 ConstraintBuilder, ReversionInfo, StepStateTransition, Transition,
             },
             from_bytes,
-            memory_gadget::{MemoryAddressGadget, MemoryCopierGasGadget, MemoryExpansionGadget},
+            memory_gadget::{
+                CommonMemoryAddressGadget, MemoryAddressGadget, MemoryCopierGasGadget,
+                MemoryExpansionGadget,
+            },
             not, select, CachedRegion, Cell, Word,
         },
         witness::{Block, Call, ExecStep, Transaction},
@@ -188,7 +191,7 @@ impl<F: Field> ExecutionGadget<F> for ExtcodecopyGadget<F> {
 
         let code_hash = block.rws[step.rw_indices[8]].account_value_pair().0;
         self.code_hash
-            .assign(region, offset, region.word_rlc(code_hash))?;
+            .assign(region, offset, region.code_hash(code_hash))?;
 
         let code_size = if code_hash.is_zero() {
             0
