@@ -83,11 +83,11 @@ use crate::{
     state_circuit::{StateCircuit, StateCircuitConfig, StateCircuitConfigArgs},
     table::{
         BlockTable, BytecodeTable, CopyTable, ExpTable, KeccakTable, MptTable, PoseidonTable,
-        RlpTable, RwTable, TxTable,
+        RlpFsmRlpTable as RlpTable, RwTable, TxTable,
     },
 };
 
-use crate::{util::circuit_stats, witness::SignedTransaction};
+use crate::util::circuit_stats;
 use bus_mapping::{
     circuit_input_builder::{CircuitInputBuilder, CircuitsParams},
     mock::BlockData,
@@ -102,7 +102,8 @@ use snark_verifier_sdk::CircuitExt;
 
 use crate::{
     pi_circuit::{PiCircuit, PiCircuitConfig, PiCircuitConfigArgs},
-    rlp_circuit::{RlpCircuit, RlpCircuitConfig},
+    rlp_circuit_fsm::{RlpCircuit, RlpCircuitConfig, RlpCircuitConfigArgs},
+    witness::Transaction,
 };
 
 /// Configuration of the Super Circuit
@@ -200,7 +201,13 @@ impl<F: Field> SubCircuitConfig<F> for SuperCircuitConfig<F> {
             PoseidonCircuitConfig::new(meta, PoseidonCircuitConfigArgs { poseidon_table });
         log_circuit_info(meta, "poseidon circuit");
 
-        let rlp_circuit = RlpCircuitConfig::configure(meta, &rlp_table, &challenges);
+        let rlp_circuit = RlpCircuitConfig::new(
+            meta,
+            RlpCircuitConfigArgs {
+                rlp_table,
+                challenges: challenges.clone(),
+            },
+        );
         log_circuit_info(meta, "rlp circuit");
 
         let pi_circuit = PiCircuitConfig::new(
@@ -361,7 +368,7 @@ pub struct SuperCircuit<
     /// Poseidon hash Circuit
     pub poseidon_circuit: PoseidonCircuit<F>,
     /// Rlp Circuit
-    pub rlp_circuit: RlpCircuit<F, SignedTransaction>,
+    pub rlp_circuit: RlpCircuit<F, Transaction>,
     /// Mpt Circuit
     #[cfg(feature = "zktrie")]
     pub mpt_circuit: MptCircuit<F>,
@@ -394,9 +401,9 @@ impl<
         let rlp = RlpCircuit::min_num_rows_block(block);
         let exp = ExpCircuit::min_num_rows_block(block);
         let pi = PiCircuit::min_num_rows_block(block);
-        let poseidon = PoseidonCircuit::min_num_rows_block(block);
+        let poseidon = (0, 0); //PoseidonCircuit::min_num_rows_block(block);
         #[cfg(feature = "zktrie")]
-        let mpt = MptCircuit::min_num_rows_block(block);
+        let mpt = (0, 0); //MptCircuit::min_num_rows_block(block);
 
         let rows: Vec<(usize, usize)> = vec![
             evm,
@@ -435,6 +442,20 @@ impl<
     > SubCircuit<F> for SuperCircuit<F, MAX_TXS, MAX_CALLDATA, MAX_INNER_BLOCKS, MOCK_RANDOMNESS>
 {
     type Config = SuperCircuitConfig<F>;
+
+    fn unusable_rows() -> usize {
+        itertools::max([
+            EvmCircuit::<F>::unusable_rows(),
+            StateCircuit::<F>::unusable_rows(),
+            TxCircuit::<F>::unusable_rows(),
+            PiCircuit::<F>::unusable_rows(),
+            BytecodeCircuit::<F>::unusable_rows(),
+            CopyCircuit::<F>::unusable_rows(),
+            ExpCircuit::<F>::unusable_rows(),
+            KeccakCircuit::<F>::unusable_rows(),
+        ])
+        .unwrap()
+    }
 
     fn new_from_block(block: &Block<F>) -> Self {
         let evm_circuit = EvmCircuit::new_from_block(block);
@@ -513,12 +534,16 @@ impl<
         self.evm_circuit
             .synthesize_sub(&config.evm_circuit, challenges, layouter)?;
 
-        // TODO: enable this after zktrie deletion deployed inside l2geth and
-        // test data regenerated.
-        // config.pi_circuit.state_roots =
-        // self.state_circuit.exports.borrow().clone();
         self.pi_circuit
             .synthesize_sub(&config.pi_circuit, challenges, layouter)?;
+
+        self.pi_circuit.connect_export(
+            layouter,
+            // TODO: enable this after zktrie deletion deployed inside l2geth and
+            // test data regenerated.
+            None,
+            self.evm_circuit.exports.borrow().as_ref(),
+        )?;
 
         self.rlp_circuit
             .synthesize_sub(&config.rlp_circuit, challenges, layouter)?;
@@ -591,6 +616,7 @@ impl<
         config.mpt_table.load(
             &mut layouter,
             &self.state_circuit.updates,
+            block.circuits_params.max_mpt_rows,
             challenges.evm_word(),
         )?;
 
@@ -668,9 +694,8 @@ impl<
             block.circuits_params
         );
 
-        const NUM_BLINDING_ROWS: usize = 64;
         let (_, rows_needed) = Self::min_num_rows_block(&block);
-        let k = log2_ceil(NUM_BLINDING_ROWS + rows_needed);
+        let k = log2_ceil(Self::unusable_rows() + rows_needed);
         log::debug!("super circuit needs k = {}", k);
 
         let circuit =

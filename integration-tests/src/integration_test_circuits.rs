@@ -47,6 +47,8 @@ const TEST_MOCK_RANDOMNESS: u64 = 0x100;
 const MAX_TXS: usize = 4;
 /// MAX_CALLDATA
 const MAX_CALLDATA: usize = 512;
+/// MAX_RLP_ROWS
+const MAX_RLP_ROWS: usize = 1000;
 /// MAX_RWS
 const MAX_RWS: usize = 5888;
 /// MAX_BYTECODE
@@ -66,12 +68,14 @@ const CIRCUITS_PARAMS: CircuitsParams = CircuitsParams {
     max_rws: MAX_RWS,
     max_txs: MAX_TXS,
     max_calldata: MAX_CALLDATA,
+    max_mpt_rows: MAX_CALLDATA,
     max_inner_blocks: 64,
     max_bytecode: MAX_BYTECODE,
     max_copy_rows: MAX_COPY_ROWS,
     max_evm_rows: MAX_EVM_ROWS,
     max_exp_steps: MAX_EXP_STEPS,
     max_keccak_rows: MAX_KECCAK_ROWS,
+    max_rlp_rows: MAX_RLP_ROWS,
 };
 
 const EVM_CIRCUIT_DEGREE: u32 = 18;

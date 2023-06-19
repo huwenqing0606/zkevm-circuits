@@ -1,18 +1,22 @@
 //! Definition of each opcode of the EVM.
 use crate::{
     circuit_input_builder::{CircuitInputStateRef, ExecStep},
-    error::{ExecError, InsufficientBalanceError, NonceUintOverflowError, OogError},
+    error::{
+        ContractAddressCollisionError, DepthError, ExecError, InsufficientBalanceError,
+        NonceUintOverflowError, OogError,
+    },
     evm::OpcodeId,
+    l2_predeployed::l1_gas_price_oracle,
     operation::{
-        AccountField, AccountOp, CallContextField, TxAccessListAccountOp, TxReceiptField,
-        TxRefundOp, RW,
+        AccountField, AccountOp, CallContextField, StorageOp, TxAccessListAccountOp,
+        TxReceiptField, TxRefundOp, RW,
     },
     state_db::CodeDB,
     Error,
 };
 use core::fmt::Debug;
 use eth_types::{
-    evm_types::{GasCost, MAX_REFUND_QUOTIENT_OF_GAS_USED},
+    evm_types::{gas_utils::tx_data_gas_cost, GasCost, MAX_REFUND_QUOTIENT_OF_GAS_USED},
     evm_unimplemented, GethExecStep, GethExecTrace, ToAddress, ToWord, Word,
 };
 use ethers_core::utils::get_contract_address;
@@ -24,6 +28,7 @@ pub use self::sha3::sha3_tests::{gen_sha3_code, MemoryKind};
 
 mod address;
 mod balance;
+mod blockhash;
 mod calldatacopy;
 mod calldataload;
 mod calldatasize;
@@ -45,6 +50,8 @@ mod mload;
 mod mstore;
 mod number;
 mod origin;
+mod precompiles;
+mod push0;
 mod return_revert;
 mod returndatacopy;
 mod returndatasize;
@@ -62,7 +69,6 @@ mod error_invalid_creation_code;
 mod error_invalid_jump;
 mod error_oog_account_access;
 mod error_oog_call;
-mod error_oog_dynamic_memory;
 mod error_oog_log;
 mod error_oog_memory_copy;
 mod error_oog_sload_sstore;
@@ -72,11 +78,14 @@ mod error_write_protection;
 
 #[cfg(test)]
 mod memory_expansion_test;
+#[cfg(feature = "test")]
+pub use callop::tests::PrecompileCallArgs;
 
 use self::sha3::Sha3;
 use crate::precompile::is_precompiled;
 use address::Address;
 use balance::Balance;
+use blockhash::Blockhash;
 use calldatacopy::Calldatacopy;
 use calldataload::Calldataload;
 use calldatasize::Calldatasize;
@@ -92,7 +101,6 @@ use error_invalid_creation_code::ErrorCreationCode;
 use error_invalid_jump::InvalidJump;
 use error_oog_account_access::ErrorOOGAccountAccess;
 use error_oog_call::OOGCall;
-use error_oog_dynamic_memory::OOGDynamicMemory;
 use error_oog_log::ErrorOOGLog;
 use error_oog_memory_copy::OOGMemoryCopy;
 use error_oog_sload_sstore::OOGSloadSstore;
@@ -108,6 +116,7 @@ use logs::Log;
 use mload::Mload;
 use mstore::Mstore;
 use origin::Origin;
+use push0::Push0;
 use return_revert::ReturnRevert;
 use returndatacopy::Returndatacopy;
 use returndatasize::Returndatasize;
@@ -151,11 +160,12 @@ type FnGenAssociatedOps = fn(
 ) -> Result<Vec<ExecStep>, Error>;
 
 fn fn_gen_associated_ops(opcode_id: &OpcodeId) -> FnGenAssociatedOps {
-    if opcode_id.is_push() {
+    if opcode_id.is_push_with_data() {
         return StackOnlyOpcode::<0, 1>::gen_associated_ops;
     }
 
     match opcode_id {
+        OpcodeId::PUSH0 => Push0::gen_associated_ops,
         OpcodeId::STOP => Stop::gen_associated_ops,
         OpcodeId::ADD => StackOnlyOpcode::<2, 1>::gen_associated_ops,
         OpcodeId::MUL => StackOnlyOpcode::<2, 1>::gen_associated_ops,
@@ -199,7 +209,7 @@ fn fn_gen_associated_ops(opcode_id: &OpcodeId) -> FnGenAssociatedOps {
         OpcodeId::RETURNDATASIZE => Returndatasize::gen_associated_ops,
         OpcodeId::RETURNDATACOPY => Returndatacopy::gen_associated_ops,
         OpcodeId::EXTCODEHASH => Extcodehash::gen_associated_ops,
-        OpcodeId::BLOCKHASH => StackOnlyOpcode::<1, 1>::gen_associated_ops,
+        OpcodeId::BLOCKHASH => Blockhash::gen_associated_ops,
         OpcodeId::COINBASE => StackOnlyOpcode::<0, 1>::gen_associated_ops,
         OpcodeId::TIMESTAMP => StackOnlyOpcode::<0, 1>::gen_associated_ops,
         OpcodeId::NUMBER => StackOnlyOpcode::<0, 1>::gen_associated_ops,
@@ -281,21 +291,29 @@ fn fn_gen_error_state_associated_ops(
     match error {
         ExecError::InvalidJump => Some(InvalidJump::gen_associated_ops),
         ExecError::InvalidOpcode => Some(StackOnlyOpcode::<0, 0, true>::gen_associated_ops),
-        ExecError::Depth => {
-            let op = geth_step.op;
-            assert!(op.is_call());
-            Some(fn_gen_associated_ops(&op))
-        }
+        // Depth error could occur in CALL, CALLCODE, DELEGATECALL and STATICCALL.
+        ExecError::Depth(DepthError::Call) => match geth_step.op {
+            OpcodeId::CALL | OpcodeId::CALLCODE => Some(CallOpcode::<7>::gen_associated_ops),
+            OpcodeId::DELEGATECALL | OpcodeId::STATICCALL => {
+                Some(CallOpcode::<6>::gen_associated_ops)
+            }
+            op => unreachable!("ErrDepth cannot occur in {op}"),
+        },
+        // Depth error could occur in CREATE and CREATE2.
+        ExecError::Depth(DepthError::Create) => Some(Create::<false>::gen_associated_ops),
+        ExecError::Depth(DepthError::Create2) => Some(Create::<true>::gen_associated_ops),
         ExecError::OutOfGas(OogError::Call) => Some(OOGCall::gen_associated_ops),
         ExecError::OutOfGas(OogError::Constant) => {
             Some(StackOnlyOpcode::<0, 0, true>::gen_associated_ops)
         }
-        ExecError::OutOfGas(OogError::Create2) => {
-            Some(StackOnlyOpcode::<4, 0, true>::gen_associated_ops)
-        }
+        ExecError::OutOfGas(OogError::Create) => match geth_step.op {
+            OpcodeId::CREATE => Some(StackOnlyOpcode::<3, 0, true>::gen_associated_ops),
+            OpcodeId::CREATE2 => Some(StackOnlyOpcode::<4, 0, true>::gen_associated_ops),
+            op => unreachable!("OOG Create cannot occur in {op}"),
+        },
         ExecError::OutOfGas(OogError::Log) => Some(ErrorOOGLog::gen_associated_ops),
         ExecError::OutOfGas(OogError::DynamicMemoryExpansion) => {
-            Some(OOGDynamicMemory::gen_associated_ops)
+            Some(StackOnlyOpcode::<2, 0, true>::gen_associated_ops)
         }
         ExecError::OutOfGas(OogError::StaticMemoryExpansion) => {
             Some(StackOnlyOpcode::<1, 0, true>::gen_associated_ops)
@@ -330,8 +348,13 @@ fn fn_gen_error_state_associated_ops(
         ExecError::PrecompileFailed => Some(PrecompileFailed::gen_associated_ops),
         ExecError::WriteProtection => Some(ErrorWriteProtection::gen_associated_ops),
         ExecError::ReturnDataOutOfBounds => Some(ErrorReturnDataOutOfBound::gen_associated_ops),
-        // only create2 may cause ContractAddressCollision error, so use Create::<true>.
-        ExecError::ContractAddressCollision => Some(Create::<true>::gen_associated_ops),
+        // create & create2 can encounter contract address collision.
+        ExecError::ContractAddressCollision(ContractAddressCollisionError::Create) => {
+            Some(Create::<false>::gen_associated_ops)
+        }
+        ExecError::ContractAddressCollision(ContractAddressCollisionError::Create2) => {
+            Some(Create::<true>::gen_associated_ops)
+        }
         // create & create2 can encounter nonce uint overflow.
         ExecError::NonceUintOverflow(NonceUintOverflowError::Create) => {
             Some(Create::<false>::gen_associated_ops)
@@ -429,7 +452,7 @@ pub fn gen_associated_ops(
             // For exceptions that already enter next call context, but fail immediately
             // (e.g. Depth, InsufficientBalance), we still need to parse the call.
             if geth_step.op.is_call_or_create()
-                && !matches!(exec_error, ExecError::OutOfGas(OogError::Create2))
+                && !matches!(exec_error, ExecError::OutOfGas(OogError::Create))
             {
                 let call = state.parse_call(geth_step)?;
                 state.push_call(call);
@@ -451,6 +474,9 @@ pub fn gen_begin_tx_ops(
 ) -> Result<(), Error> {
     let mut exec_step = state.new_begin_tx_step();
     let call = state.call()?.clone();
+
+    // Add 3 RW read operations for transaction L1 fee.
+    gen_tx_l1_fee_ops(state, &mut exec_step);
 
     for (field, value) in [
         (CallContextField::TxId, state.tx_ctx.id().into()),
@@ -483,8 +509,21 @@ pub fn gen_begin_tx_ops(
         nonce_prev,
     )?;
 
-    // Add caller and callee into access list
-    for address in [call.caller_address, call.address] {
+    // Add caller, callee and coinbase (only for Shanghai) to access list.
+    #[cfg(feature = "shanghai")]
+    let accessed_addresses = [
+        call.caller_address,
+        call.address,
+        state
+            .block
+            .headers
+            .get(&state.tx.block_num)
+            .unwrap()
+            .coinbase,
+    ];
+    #[cfg(not(feature = "shanghai"))]
+    let accessed_addresses = [call.caller_address, call.address];
+    for address in accessed_addresses {
         let is_warm_prev = !state.sdb.add_account_to_access_list(address);
         state.tx_accesslist_account_write(
             &mut exec_step,
@@ -495,17 +534,24 @@ pub fn gen_begin_tx_ops(
         )?;
     }
 
+    // Calculate gas cost of init code only for EIP-3860 of Shanghai.
+    #[cfg(feature = "shanghai")]
+    let init_code_gas_cost = if state.tx.is_create() {
+        (state.tx.input.len() as u64 + 31) / 32 * eth_types::evm_types::INIT_CODE_WORD_GAS
+    } else {
+        0
+    };
+    #[cfg(not(feature = "shanghai"))]
+    let init_code_gas_cost = 0;
+
     // Calculate intrinsic gas cost
-    let call_data_gas_cost = state
-        .tx
-        .input
-        .iter()
-        .fold(0, |acc, byte| acc + if *byte == 0 { 4 } else { 16 });
+    let call_data_gas_cost = tx_data_gas_cost(&state.tx.input);
     let intrinsic_gas_cost = if state.tx.is_create() {
         GasCost::CREATION_TX.as_u64()
     } else {
         GasCost::TX.as_u64()
-    } + call_data_gas_cost;
+    } + call_data_gas_cost
+        + init_code_gas_cost;
     exec_step.gas_cost = GasCost(intrinsic_gas_cost);
 
     // Get code_hash of callee
@@ -801,6 +847,56 @@ pub fn gen_end_tx_ops(state: &mut CircuitInputStateRef) -> Result<ExecStep, Erro
     }
 
     Ok(exec_step)
+}
+
+// Add 3 RW read operations for transaction L1 fee.
+fn gen_tx_l1_fee_ops(state: &mut CircuitInputStateRef, exec_step: &mut ExecStep) {
+    let tx_id = state.tx_ctx.id();
+
+    let base_fee = Word::from(state.tx.l1_fee.base_fee);
+    let fee_overhead = Word::from(state.tx.l1_fee.fee_overhead);
+    let fee_scalar = Word::from(state.tx.l1_fee.fee_scalar);
+
+    let base_fee_committed = Word::from(state.tx.l1_fee_committed.base_fee);
+    let fee_overhead_committed = Word::from(state.tx.l1_fee_committed.fee_overhead);
+    let fee_scalar_committed = Word::from(state.tx.l1_fee_committed.fee_scalar);
+
+    state.push_op(
+        exec_step,
+        RW::READ,
+        StorageOp::new(
+            *l1_gas_price_oracle::ADDRESS,
+            *l1_gas_price_oracle::BASE_FEE_SLOT,
+            base_fee,
+            base_fee,
+            tx_id,
+            base_fee_committed,
+        ),
+    );
+    state.push_op(
+        exec_step,
+        RW::READ,
+        StorageOp::new(
+            *l1_gas_price_oracle::ADDRESS,
+            *l1_gas_price_oracle::OVERHEAD_SLOT,
+            fee_overhead,
+            fee_overhead,
+            tx_id,
+            fee_overhead_committed,
+        ),
+    );
+    state.push_op(
+        exec_step,
+        RW::READ,
+        StorageOp::new(
+            *l1_gas_price_oracle::ADDRESS,
+            *l1_gas_price_oracle::SCALAR_SLOT,
+            fee_scalar,
+            fee_scalar,
+            tx_id,
+            fee_scalar_committed,
+        ),
+    );
 }
 
 #[derive(Debug, Copy, Clone)]

@@ -5,8 +5,13 @@ use super::{
     CallKind, CodeSource, CopyEvent, ExecState, ExecStep, ExpEvent, Transaction,
     TransactionContext,
 };
+#[cfg(feature = "scroll")]
+use crate::util::KECCAK_CODE_HASH_ZERO;
 use crate::{
-    error::{get_step_reported_error, ExecError, InsufficientBalanceError, NonceUintOverflowError},
+    error::{
+        get_step_reported_error, ContractAddressCollisionError, DepthError, ExecError,
+        InsufficientBalanceError, NonceUintOverflowError,
+    },
     exec_trace::OperationRef,
     operation::{
         AccountField, AccountOp, CallContextField, CallContextOp, MemoryOp, Op, OpEnum, Operation,
@@ -356,7 +361,10 @@ impl<'a> CircuitInputStateRef<'a> {
         if matches!(rw, RW::WRITE) {
             match op.field {
                 AccountField::Nonce => account.nonce = op.value,
-                AccountField::Balance => account.balance = op.value,
+                AccountField::Balance => {
+                    log::trace!("update balance of {:?} to {:?}", &op.address, op.value);
+                    account.balance = op.value;
+                }
                 AccountField::KeccakCodeHash => {
                     account.keccak_code_hash = H256::from(op.value.to_be_bytes())
                 }
@@ -581,6 +589,16 @@ impl<'a> CircuitInputStateRef<'a> {
                     address: receiver,
                     field: AccountField::CodeHash,
                     value: CodeDB::empty_code_hash().to_word(),
+                    value_prev: Word::zero(),
+                },
+            )?;
+            #[cfg(feature = "scroll")]
+            self.push_op_reversible(
+                step,
+                AccountOp {
+                    address: receiver,
+                    field: AccountField::KeccakCodeHash,
+                    value: KECCAK_CODE_HASH_ZERO.to_word(),
                     value_prev: Word::zero(),
                 },
             )?;
@@ -1183,7 +1201,7 @@ impl<'a> CircuitInputStateRef<'a> {
             _ => [Word::zero(), Word::zero()],
         };
 
-        let gas_refund = if exec_step.error.is_some() {
+        let gas_refund = if exec_step.error.is_some() || exec_step.is_precompiled() {
             0
         } else {
             let curr_memory_word_size = (exec_step.memory_size as u64) / 32;
@@ -1264,7 +1282,7 @@ impl<'a> CircuitInputStateRef<'a> {
 
     /// Push a copy event to the state.
     pub fn push_copy(&mut self, step: &mut ExecStep, event: CopyEvent) {
-        step.copy_rw_counter_delta = event.rw_counter_delta();
+        step.copy_rw_counter_delta += event.rw_counter_delta();
         self.block.add_copy_event(event);
     }
 
@@ -1351,7 +1369,7 @@ impl<'a> CircuitInputStateRef<'a> {
                     _ => {
                         return Err(Error::UnexpectedExecStepError(
                             "call failure without return",
-                            step.clone(),
+                            Box::new(step.clone()),
                         ));
                     }
                 });
@@ -1372,13 +1390,13 @@ impl<'a> CircuitInputStateRef<'a> {
                     } else {
                         return Err(Error::UnexpectedExecStepError(
                             "failure in RETURN from {CREATE, CREATE2}",
-                            step.clone(),
+                            Box::new(step.clone()),
                         ));
                     }
                 } else {
                     return Err(Error::UnexpectedExecStepError(
                         "failure in RETURN",
-                        step.clone(),
+                        Box::new(step.clone()),
                     ));
                 }
             }
@@ -1398,7 +1416,7 @@ impl<'a> CircuitInputStateRef<'a> {
         {
             return Err(Error::UnexpectedExecStepError(
                 "success result without {RETURN, STOP, SELFDESTRUCT}",
-                step.clone(),
+                Box::new(step.clone()),
             ));
         }
 
@@ -1417,7 +1435,15 @@ impl<'a> CircuitInputStateRef<'a> {
             && next_pc != 0
         {
             if step.depth == 1025 {
-                return Ok(Some(ExecError::Depth));
+                return Ok(Some(ExecError::Depth(match step.op {
+                    OpcodeId::CALL
+                    | OpcodeId::CALLCODE
+                    | OpcodeId::DELEGATECALL
+                    | OpcodeId::STATICCALL => DepthError::Call,
+                    OpcodeId::CREATE => DepthError::Create,
+                    OpcodeId::CREATE2 => DepthError::Create2,
+                    op => unreachable!("ErrDepth cannot occur in {op}"),
+                })));
             }
 
             let sender = self.call()?.address;
@@ -1447,9 +1473,15 @@ impl<'a> CircuitInputStateRef<'a> {
 
             // Address collision
             if matches!(step.op, OpcodeId::CREATE | OpcodeId::CREATE2) {
-                let address = match step.op {
-                    OpcodeId::CREATE => self.create_address()?,
-                    OpcodeId::CREATE2 => self.create2_address(step)?,
+                let (address, contract_addr_collision_err) = match step.op {
+                    OpcodeId::CREATE => (
+                        self.create_address()?,
+                        ContractAddressCollisionError::Create,
+                    ),
+                    OpcodeId::CREATE2 => (
+                        self.create2_address(step)?,
+                        ContractAddressCollisionError::Create2,
+                    ),
                     _ => unreachable!(),
                 };
                 let (found, _) = self.sdb.get_account(&address);
@@ -1460,7 +1492,9 @@ impl<'a> CircuitInputStateRef<'a> {
                         step,
                         next_step
                     );
-                    return Ok(Some(ExecError::ContractAddressCollision));
+                    return Ok(Some(ExecError::ContractAddressCollision(
+                        contract_addr_collision_err,
+                    )));
                 }
             }
 
@@ -1483,7 +1517,7 @@ impl<'a> CircuitInputStateRef<'a> {
 
             return Err(Error::UnexpectedExecStepError(
                 "*CALL*/CREATE* code not executed",
-                step.clone(),
+                Box::new(step.clone()),
             ));
         }
 
